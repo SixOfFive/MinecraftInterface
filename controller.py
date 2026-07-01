@@ -135,7 +135,7 @@ async def spawn_bot(cfg: argparse.Namespace) -> asyncio.subprocess.Process:
         "BRIDGE_PORT": str(cfg.bridge_port),
     })
     return await asyncio.create_subprocess_exec(
-        node, "bot.js", cwd=str(BOT_DIR), env=env,
+        node, "--expose-gc", "bot.js", cwd=str(BOT_DIR), env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
 

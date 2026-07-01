@@ -560,8 +560,9 @@ const ACTIONS = {
       const block = bot.blockAt(pos)
       if (!block || block.name !== name) continue
       try {
-        if (collectPlugin && bot.collectBlock) await bot.collectBlock.collect(block)
-        else { await bot.pathfinder.goto(new GoalGetToBlock(pos.x, pos.y, pos.z)); await equipBestTool(block); if (bot.canDigBlock(block)) await bot.dig(block) }
+        await bot.pathfinder.goto(new GoalGetToBlock(pos.x, pos.y, pos.z))
+        await equipBestTool(block)
+        if (bot.canDigBlock(block)) await bot.dig(block)
         mined++
       } catch (e) {}
       if (mined >= count) break
@@ -625,8 +626,9 @@ const ACTIONS = {
       const key = `${block.position.x},${block.position.y},${block.position.z}`
       if (key === stuckKey) break // couldn't make progress on the nearest block
       try {
-        if (collectPlugin && bot.collectBlock) await bot.collectBlock.collect(block)
-        else { await bot.pathfinder.goto(new GoalGetToBlock(block.position.x, block.position.y, block.position.z)); await equipBestTool(block); if (bot.canDigBlock(block)) await bot.dig(block) }
+        await bot.pathfinder.goto(new GoalGetToBlock(block.position.x, block.position.y, block.position.z))
+        await equipBestTool(block)
+        if (bot.canDigBlock(block)) await bot.dig(block)
         harvested[block.name] = (harvested[block.name] || 0) + 1
         total++
         stuckKey = null
@@ -776,5 +778,24 @@ function shutdown () {
 }
 process.on('SIGINT', shutdown)
 process.on('SIGTERM', shutdown)
+
+// Memory watchdog — logs the breakdown so growth is visible (chunks vs heap vs
+// buffers), and forces GC when heap runs high (node is launched with --expose-gc).
+setInterval(() => {
+  try {
+    if (!bot) return
+    const m = process.memoryUsage()
+    const mb = (b) => Math.round(b / 1048576)
+    let chunks = '?'
+    try {
+      const w = bot.world
+      if (w && w.columns) chunks = Object.keys(w.columns).length
+      else if (w && typeof w.getColumns === 'function') chunks = w.getColumns().length
+    } catch (e) {}
+    const ents = bot.entities ? Object.keys(bot.entities).length : '?'
+    log(`mem heap=${mb(m.heapUsed)} rss=${mb(m.rss)} ext=${mb(m.external)} arr=${mb(m.arrayBuffers)} MB | chunks=${chunks} entities=${ents}`)
+    if (global.gc && m.heapUsed > 1500 * 1048576) { global.gc(); log('forced GC') }
+  } catch (e) {}
+}, parseInt(process.env.MEM_LOG_MS || '10000', 10))
 
 createBot()
