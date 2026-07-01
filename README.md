@@ -10,7 +10,7 @@ Minecraft Java server  ⇄  bot/bot.js  (Mineflayer "hands": pathfinding, mining
                               ⇅  newline-delimited JSON over a local TCP socket
                           controller.py → agent.py  (the "brain": observe → decide → act)
                               ⇅  HTTP  (/api/chat, grammar-constrained JSON)
-                          Ollama  (qwen3:4b, etc.)  — chooses the next action
+                          Ollama  (qwen2.5:7b, etc.)  — chooses the next action
 ```
 
 The **brain is 100% Python standard library** (no `pip install` needed). The
@@ -27,7 +27,7 @@ just executes one low‑level action per request.
 |------|--------------|
 | **Node.js ≥ 22** (Mineflayer 4.37 requires it) | ✅ v24 |
 | **Python 3.10+** (tested on 3.14) | ✅ 3.14 |
-| **Ollama** running with an instruct model | e.g. `qwen3:4b` (default `localhost:11434`) |
+| **Ollama** running with an instruct model | e.g. `qwen2.5:7b` (default `localhost:11434`) |
 | **Minecraft Java Edition** on a supported version (**1.21.11**, newest Mineflayer supports) | install 1.21.11 |
 
 No Python packages are required. Node dependencies install automatically on first
@@ -167,7 +167,7 @@ model, and owner name live, so they never get committed.
 | `--owner` | `MC_OWNER` | *(none)* | Player the bot protects / flees toward |
 | `--auth` | `MC_AUTH` | `offline` | `offline` or `microsoft` |
 | `--mc-version` | `MC_VERSION` | *(auto)* | Blank = auto‑detect. If pinning, use a supported **anchor** (see below) |
-| `--model` | `OLLAMA_MODEL` | `qwen3:4b` | Ollama model (try `ministral-3:14b` for smarter, slower play) |
+| `--model` | `OLLAMA_MODEL` | `qwen2.5:7b` | Ollama model (try `ministral-3:14b` for smarter, slower play) |
 | `--ollama-url` | `OLLAMA_URL` | `http://localhost:11434` | Ollama endpoint (set yours in `.env`) |
 | `--temperature` | `OLLAMA_TEMP` | `0.3` | LLM sampling temperature |
 | `--tick` | `AGENT_TICK` | `2.0` | Seconds between think‑steps while chasing a goal |
@@ -213,9 +213,10 @@ its output is always a valid action object — no markdown fences or stray prose
   is actually open to LAN.
 - **`You logged in from another location` / instant kick** — another player/bot uses
   the same name. Pass a unique `--username`.
-- **`model ... not found`** — `ollama pull qwen3:4b` (or point `--model` at one
+- **`model ... not found`** — `ollama pull qwen2.5:7b` (or point `--model` at one
   from `--list-models`, or switch live with the `model` console command). Good picks:
-  `qwen3:4b` / `qwen2.5:7b` (fast), `qwen2.5:14b-instruct` or `ministral-3:14b` (smarter, slower).
+  `qwen2.5:7b` (fast, reliable), `qwen2.5:14b-instruct` or `ministral-3:14b` (smarter, slower),
+  `qwen3:4b` (smallest/fastest, weaker planner).
 - **Mining a block drops nothing** — it needs the right tool (ores need a pickaxe,
   etc.). Put a tool in the bot's inventory; `mineflayer-collectblock` auto‑equips it.
 - **Bot digs through your builds to reach a goal** — set `MOVE_CAN_DIG=false`.

@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bridge-host", default=env("BRIDGE_HOST", "127.0.0.1"))
     p.add_argument("--bridge-port", type=int, default=int(env("BRIDGE_PORT", "25585")))
     p.add_argument("--ollama-url", default=env("OLLAMA_URL", "http://localhost:11434"))
-    p.add_argument("--model", default=env("OLLAMA_MODEL", "qwen3:4b"))
+    p.add_argument("--model", default=env("OLLAMA_MODEL", "qwen2.5:7b"))
     p.add_argument("--temperature", type=float, default=float(env("OLLAMA_TEMP", "0.3")))
     p.add_argument("--tick", type=float, default=float(env("AGENT_TICK", "2.0")),
                    help="Seconds between think-steps while pursuing a goal.")
