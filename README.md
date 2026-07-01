@@ -90,7 +90,7 @@ owner <player>     set who the bot protects / flees toward
 say <text>         speak in chat right now
 stop               clear the goal/job and halt movement/combat
 state              print the current world observation the LLM sees
-models             list local Ollama models
+model [n|name]     list the server's models / switch the active one live
 quit               exit
 ```
 

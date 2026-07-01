@@ -184,7 +184,7 @@ async def console(agent: Agent, bridge: BotBridge, llm: OllamaClient,
             continue
         verb, _, rest = line.partition(" ")
         rest = rest.strip()
-        v = verb.lower()
+        v = verb.lower().lstrip("/")  # tolerate a leading slash, e.g. /model
         try:
             if v in ("quit", "exit"):
                 shutdown.set()
@@ -237,8 +237,33 @@ async def console(agent: Agent, bridge: BotBridge, llm: OllamaClient,
                 print("[you] stopped")
             elif v == "state":
                 print(json.dumps(await bridge.send("state", timeout=15), indent=2))
-            elif v == "models":
-                print(", ".join(await llm.list_models()))
+            elif v in ("model", "models"):
+                models = await llm.list_models()
+                if not models:
+                    print("[model] no models found on the server")
+                elif not rest:
+                    print(f"[model] {llm.url}  (current: {llm.model})")
+                    for i, m in enumerate(models, 1):
+                        print(f"   {i:>2}  {m}" + ("   <- current" if m == llm.model else ""))
+                    print("Switch with:  model <number|name>")
+                else:
+                    matches = [m for m in models if m.startswith(rest)]
+                    chosen = None
+                    if rest.isdigit() and 1 <= int(rest) <= len(models):
+                        chosen = models[int(rest) - 1]
+                    elif rest in models:
+                        chosen = rest
+                    elif len(matches) == 1:
+                        chosen = matches[0]
+                    if chosen:
+                        llm.model = chosen
+                        print(f"[model] switched to {chosen} — warming up ...")
+                        ok = await llm.warmup()
+                        print(f"[model] {chosen} ready." if ok else f"[model] {chosen} selected (warmup failed).")
+                    elif len(matches) > 1:
+                        print(f"[model] ambiguous '{rest}': {', '.join(matches)}")
+                    else:
+                        print(f"[model] no match for {rest!r} — type `model` to list.")
             else:
                 # Anything else is treated as a goal, for convenience.
                 agent.set_goal(line)
@@ -259,7 +284,7 @@ def print_help() -> None:
         "  say <text>         make the bot say something in chat right now\n"
         "  stop               clear the goal/job and halt movement/combat\n"
         "  state              print the current world observation\n"
-        "  models             list local Ollama models\n"
+        "  model [n|name]     list the server's models / switch the active one live\n"
         "  help               show this help\n"
         "  quit               exit\n"
         "You can also just talk to the bot in-game chat.\n",
