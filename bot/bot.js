@@ -315,7 +315,7 @@ async function reflexTick () {
     if (isBusy()) return
     if (RX.autoPickup) {
       const item = bot.nearestEntity((e) =>
-        (e.name === 'item' || e.objectType === 'Item') && e.position &&
+        e.name === 'item' && e.position &&
         bot.entity.position.distanceTo(e.position) <= RX.pickupRadius)
       if (item) { try { bot.pathfinder.setGoal(new GoalNear(item.position.x, item.position.y, item.position.z, 1)) } catch (e) {} return }
     }
@@ -557,7 +557,7 @@ const ACTIONS = {
     const maxDistance = clamp(args.maxDistance || 16, 1, 48)
     let visited = 0
     for (let i = 0; i < 16; i++) {
-      const item = bot.nearestEntity((en) => (en.name === 'item' || en.objectType === 'Item') && bot.entity.position.distanceTo(en.position) <= maxDistance)
+      const item = bot.nearestEntity((en) => en.name === 'item' && en.position && bot.entity.position.distanceTo(en.position) <= maxDistance)
       if (!item) break
       const p = item.position
       try { await bot.pathfinder.goto(new GoalNear(p.x, p.y, p.z, 1)); visited++; await sleep(200) } catch (e) { break }
