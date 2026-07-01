@@ -87,6 +87,7 @@ job <name|text>    STANDING job that never times out:
                      guard | patrol | harvest | stash | lumberjack | miner | defend <player> | gather <block>
 reflex on|off <x>  toggle a reflex: eat|defend|pickup|wander|greet   (no arg = show autopilot)
 owner <player>     set who the bot protects / flees toward
+narrate on|off     announce activity changes in chat ("gathering oak_log", "stashing...")
 say <text>         speak in chat right now
 stop               clear the goal/job and halt movement/combat
 state              print the current world observation the LLM sees
@@ -177,6 +178,7 @@ last‑resort fallback constant, `DEFAULT_MODEL` in `ollama_client.py`.)
 | `--tick` | `AGENT_TICK` | `2.0` | Seconds between think‑steps while chasing a goal |
 | `--heartbeat` | `AGENT_HEARTBEAT` | `0` (off) | Auto‑resume the last goal/job after N idle seconds |
 | `--status-interval` | `AGENT_STATUS_INTERVAL` | `30` | Print a one‑line status update every N seconds (0 = off) |
+| `--narrate` / `--no-narrate` | `AGENT_NARRATE` | on | Announce activity changes in chat (gathering/stashing/following/…) |
 | `--bridge-port` | `BRIDGE_PORT` | `25585` | Local TCP port between Python and `bot.js` (auto‑bumps if busy) |
 | `--external-bot` | — | off | Don't spawn `bot.js`; connect to one you started |
 | `--list-models` | — | — | Print local Ollama models and exit |

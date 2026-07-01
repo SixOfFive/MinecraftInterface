@@ -92,6 +92,9 @@ def parse_args() -> argparse.Namespace:
                    help="If >0, auto-resume the last goal/job after this many idle seconds.")
     p.add_argument("--status-interval", type=float, default=float(env("AGENT_STATUS_INTERVAL", "30")),
                    help="Print a one-line status update every N seconds (0 = off).")
+    p.add_argument("--narrate", action=argparse.BooleanOptionalAction,
+                   default=env("AGENT_NARRATE", "1") not in ("0", "false", "False", "off"),
+                   help="Announce activity changes in chat (default on; --no-narrate to disable).")
     p.add_argument("--goal", default=None, help="Initial goal to pursue on startup.")
     p.add_argument("--no-warmup", action="store_true", help="Skip preloading the model at startup.")
     p.add_argument("--external-bot", action="store_true",
@@ -268,6 +271,14 @@ async def console(agent: Agent, bridge: BotBridge, llm: OllamaClient,
                     print(f"[you] heartbeat = {agent.heartbeat}s" + (" (off)" if agent.heartbeat <= 0 else ""))
                 except ValueError:
                     print("[error] usage: heartbeat <seconds>  (0 = off)")
+            elif v == "narrate":
+                if rest.lower() in ("off", "0", "false", "no"):
+                    agent.narrate = False
+                elif rest.lower() in ("on", "1", "true", "yes"):
+                    agent.narrate = True
+                else:
+                    agent.narrate = not agent.narrate
+                print(f"[you] narration {'on' if agent.narrate else 'off'}")
             elif v == "say":
                 await bridge.send("chat", message=rest, timeout=15)
             elif v == "stop":
@@ -320,6 +331,7 @@ def print_help() -> None:
         "  reflex on|off <x>  toggle a reflex: eat|defend|pickup|wander|greet  (no arg = show autopilot)\n"
         "  owner <player>     set who the bot protects / flees toward\n"
         "  heartbeat <secs>   auto-resume the last goal/job after N idle seconds (0 = off)\n"
+        "  narrate on|off     announce activity changes in chat\n"
         "  say <text>         make the bot say something in chat right now\n"
         "  stop               clear the goal/job and halt movement/combat\n"
         "  state              print the current world observation\n"
@@ -390,7 +402,8 @@ async def main() -> None:
             await asyncio.sleep(0.25)
         await connect_task  # re-raises BotError if unreachable
 
-        agent = Agent(bridge, llm, username=cfg.username, tick=cfg.tick, heartbeat=cfg.heartbeat)
+        agent = Agent(bridge, llm, username=cfg.username, tick=cfg.tick,
+                      heartbeat=cfg.heartbeat, narrate=cfg.narrate)
 
         def on_event(event: str, data: dict) -> None:
             if event == "chat":

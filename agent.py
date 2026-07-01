@@ -113,6 +113,7 @@ class Agent:
         username: str = "ClaudeBot",
         tick: float = 2.0,
         heartbeat: float = 0.0,
+        narrate: bool = True,
         max_goal_steps: int = 40,
         verbose: bool = True,
     ) -> None:
@@ -121,6 +122,8 @@ class Agent:
         self.username = username
         self.tick = tick
         self.heartbeat = heartbeat  # >0: re-issue last directive after this many idle seconds
+        self.narrate = narrate  # announce activity changes in chat
+        self._last_narration = ""
         self.max_goal_steps = max_goal_steps
         self.verbose = verbose
 
@@ -329,6 +332,9 @@ class Agent:
         self.recent.append((self._sig(action, cmd[1] if cmd else {}), effective, result_summary))
         self.history.append(f"{action}({_short(cmd[1]) if cmd else ''}) -> {result_summary}")
 
+        if self.narrate:
+            await self._maybe_announce(state, action, cmd[1] if cmd else {}, result_obj)
+
         if bool(decision.get("goal_complete")) and self.goal is not None and not self.persistent:
             self._log(f"goal complete: {self.goal}")
             self.goal = None
@@ -385,6 +391,61 @@ class Agent:
             await self.bridge.send("stop", timeout=15)
         except BotError:
             pass
+
+    # -- activity narration ----------------------------------------------
+    async def _maybe_announce(self, state: dict, action: str, args: dict, result) -> None:
+        """Say what the bot is doing in chat, but only when the activity changes."""
+        ap = state.get("autopilot") or {}
+        if ap.get("fleeing"):
+            phrase = "retreating from danger!"
+        elif ap.get("fighting"):
+            phrase = "fighting off a mob!"
+        else:
+            phrase = self._narration(action, args, result)
+        if phrase and phrase != self._last_narration:
+            self._last_narration = phrase
+            try:
+                await self.bridge.send("chat", message=phrase, timeout=15)
+            except BotError:
+                pass
+
+    @staticmethod
+    def _narration(action: str, args: dict, result) -> Optional[str]:
+        r = result if isinstance(result, dict) else {}
+        if action == "harvestNearest":
+            if (r.get("total") or 0) > 0:
+                return f"gathering {next(iter(r.get('harvested') or {}), 'resources')}"
+            return "wandering to find resources"
+        if action == "mine":
+            return f"mining {args.get('name', 'blocks')}"
+        if action == "stashResources":
+            dep = r.get("deposited") or {}
+            if dep:
+                return "stashing to chest: " + ", ".join(f"{v} {k}" for k, v in dep.items())
+            return "heading to a chest to stash"
+        if action == "depositChest":
+            return f"stashing {args.get('name', 'items')} in the chest"
+        if action == "collect":
+            return "picking up dropped items"
+        if action == "gotoPlayer":
+            return f"moving closer to {args.get('username', 'you')}"
+        if action == "follow":
+            return f"following {args.get('username', 'you')}"
+        if action == "goto":
+            return f"heading to ({int(args.get('x', 0))}, {int(args.get('y', 0))}, {int(args.get('z', 0))})"
+        if action == "attack":
+            return f"fighting {args.get('target', 'a mob')}"
+        if action == "flee":
+            return "retreating!"
+        if action == "eat":
+            return "grabbing a bite to eat"
+        if action == "sleep":
+            return "getting some sleep"
+        if action == "craft":
+            return f"crafting {args.get('name', 'something')}"
+        if action == "place":
+            return f"building with {args.get('name', 'blocks')}"
+        return None
 
     def stop(self) -> None:
         self._running = False
