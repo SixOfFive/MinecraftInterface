@@ -22,7 +22,7 @@ from pathlib import Path
 
 from agent import Agent
 from bridge import BotBridge, BotError
-from ollama_client import OllamaClient, OllamaError
+from ollama_client import DEFAULT_MODEL, DEFAULT_OLLAMA_URL, OllamaClient, OllamaError
 
 BOT_DIR = Path(__file__).resolve().parent / "bot"
 
@@ -83,8 +83,8 @@ def parse_args() -> argparse.Namespace:
                    help="Blank = auto-detect (recommended). If pinning, use a supported anchor (e.g. 1.21.8).")
     p.add_argument("--bridge-host", default=env("BRIDGE_HOST", "127.0.0.1"))
     p.add_argument("--bridge-port", type=int, default=int(env("BRIDGE_PORT", "25585")))
-    p.add_argument("--ollama-url", default=env("OLLAMA_URL", "http://localhost:11434"))
-    p.add_argument("--model", default=env("OLLAMA_MODEL", "qwen2.5:7b"))
+    p.add_argument("--ollama-url", default=env("OLLAMA_URL", DEFAULT_OLLAMA_URL))
+    p.add_argument("--model", default=env("OLLAMA_MODEL", DEFAULT_MODEL))
     p.add_argument("--temperature", type=float, default=float(env("OLLAMA_TEMP", "0.3")))
     p.add_argument("--tick", type=float, default=float(env("AGENT_TICK", "2.0")),
                    help="Seconds between think-steps while pursuing a goal.")

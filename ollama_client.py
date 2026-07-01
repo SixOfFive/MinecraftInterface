@@ -18,6 +18,12 @@ import urllib.request
 from typing import Any, Callable, Optional
 
 
+# Code-side fallbacks, used only when nothing is set. The single place YOU edit to
+# change the model is OLLAMA_MODEL in the project-root .env file (see .env.example).
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_MODEL = "qwen2.5:7b"
+
+
 class OllamaError(Exception):
     pass
 
@@ -41,8 +47,8 @@ async def _in_daemon_thread(func: Callable[[], Any]) -> Any:
 class OllamaClient:
     def __init__(
         self,
-        url: str = "http://localhost:11434",
-        model: str = "qwen2.5:7b",
+        url: str = DEFAULT_OLLAMA_URL,
+        model: str = DEFAULT_MODEL,
         temperature: float = 0.3,
         keep_alive: str = "30m",
         num_predict: int = 512,

@@ -159,6 +159,10 @@ Every flag has an environment‑variable fallback, and machine‑specific settin
 **gitignored `.env`** (copy `.env.example` → `.env`) — that's where your Ollama endpoint,
 model, and owner name live, so they never get committed.
 
+**Changing the model is one line:** edit `OLLAMA_MODEL` in `.env` — that's the single place
+you set which model the bots think with. (Nothing else hardcodes a model except one
+last‑resort fallback constant, `DEFAULT_MODEL` in `ollama_client.py`.)
+
 | Flag | Env | Default | Meaning |
 |------|-----|---------|---------|
 | `--mc-host` | `MC_HOST` | `127.0.0.1` | Server host |
