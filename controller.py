@@ -90,6 +90,8 @@ def parse_args() -> argparse.Namespace:
                    help="Seconds between think-steps while pursuing a goal.")
     p.add_argument("--heartbeat", type=float, default=float(env("AGENT_HEARTBEAT", "0")),
                    help="If >0, auto-resume the last goal/job after this many idle seconds.")
+    p.add_argument("--status-interval", type=float, default=float(env("AGENT_STATUS_INTERVAL", "30")),
+                   help="Print a one-line status update every N seconds (0 = off).")
     p.add_argument("--goal", default=None, help="Initial goal to pursue on startup.")
     p.add_argument("--no-warmup", action="store_true", help="Skip preloading the model at startup.")
     p.add_argument("--external-bot", action="store_true",
@@ -145,6 +147,41 @@ async def pipe_output(proc: asyncio.subprocess.Process) -> None:
         if not line:
             break
         print(line.decode("utf-8", "replace").rstrip(), flush=True)
+
+
+async def status_ticker(bridge: BotBridge, agent: Agent, shutdown: asyncio.Event, interval: float) -> None:
+    """Print a one-line status update every `interval` seconds (0 = off)."""
+    if interval <= 0:
+        return
+    while not shutdown.is_set():
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=interval)
+            break  # shutdown fired
+        except asyncio.TimeoutError:
+            pass
+        if not bridge.ready:
+            print("[status] offline — bot disconnected / trying to reconnect", flush=True)
+            continue
+        try:
+            s = await bridge.send("state", timeout=10)
+        except BotError:
+            print("[status] (state unavailable)", flush=True)
+            continue
+        pos = s.get("position") or {}
+        ap = s.get("autopilot") or {}
+        inv = s.get("inventory") or {}
+        players = s.get("players") or []
+        kind = "job" if agent.persistent else "goal"
+        goal = agent.goal or "(idle)"
+        goal = goal if len(goal) <= 40 else goal[:39] + "…"
+        doing = "fighting" if ap.get("fighting") else ("fleeing" if ap.get("fleeing") else "ok")
+        near = f"{players[0]['username']}@{round(players[0]['distance'])}m" if players else "none"
+        print(
+            f"[status] {kind}: {goal} | pos ({int(pos.get('x', 0))},{int(pos.get('y', 0))},{int(pos.get('z', 0))}) "
+            f"hp {s.get('health')}/20 food {s.get('food')}/20 | held {s.get('heldItem') or '-'} "
+            f"| items {sum(inv.values())} | nearest {near} | {doing}",
+            flush=True,
+        )
 
 
 async def watch_proc(proc: asyncio.subprocess.Process, shutdown: asyncio.Event) -> None:
@@ -393,6 +430,7 @@ async def main() -> None:
         start_stdin_reader(asyncio.get_running_loop(), cmd_queue)
         tasks.append(asyncio.create_task(agent.run()))
         tasks.append(asyncio.create_task(console(agent, bridge, llm, shutdown, cmd_queue)))
+        tasks.append(asyncio.create_task(status_ticker(bridge, agent, shutdown, cfg.status_interval)))
 
         await shutdown.wait()
     finally:

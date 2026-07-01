@@ -176,13 +176,16 @@ last‑resort fallback constant, `DEFAULT_MODEL` in `ollama_client.py`.)
 | `--temperature` | `OLLAMA_TEMP` | `0.3` | LLM sampling temperature |
 | `--tick` | `AGENT_TICK` | `2.0` | Seconds between think‑steps while chasing a goal |
 | `--heartbeat` | `AGENT_HEARTBEAT` | `0` (off) | Auto‑resume the last goal/job after N idle seconds |
+| `--status-interval` | `AGENT_STATUS_INTERVAL` | `30` | Print a one‑line status update every N seconds (0 = off) |
 | `--bridge-port` | `BRIDGE_PORT` | `25585` | Local TCP port between Python and `bot.js` (auto‑bumps if busy) |
 | `--external-bot` | — | off | Don't spawn `bot.js`; connect to one you started |
 | `--list-models` | — | — | Print local Ollama models and exit |
 
 Node‑side extras (env only): `MC_VIEW_DISTANCE` (`tiny`/`short`/`normal`/`far` — default
 `tiny` to keep chunk memory low and avoid heap OOM), `MOVE_CAN_DIG` (`true`/`false` — let
-the bot tunnel to reach goals), `MC_AUTO_RECONNECT`, `MC_RECONNECT_MS`, and the reflex knobs
+the bot tunnel to reach goals), `MC_AUTO_RECONNECT`, `MC_RECONNECT_MS`, `MC_MAX_RECONNECT`
+(give up + exit after N failed reconnects so the controller can terminate; `0` = retry forever),
+and the reflex knobs
 (`AUTO_EAT`, `AUTO_DEFEND`, `AUTO_PICKUP`, `IDLE_WANDER`, `GREET`, `EAT_AT`,
 `DEFEND_RADIUS`, `FLEE_HEALTH`) — see **Autonomy** above.
 

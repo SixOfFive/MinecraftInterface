@@ -47,6 +47,7 @@ const CONFIG = {
   canDig: envBool('MOVE_CAN_DIG', true),
   autoReconnect: envBool('MC_AUTO_RECONNECT', true),
   reconnectDelayMs: parseInt(process.env.MC_RECONNECT_MS || '5000', 10),
+  maxReconnect: parseInt(process.env.MC_MAX_RECONNECT || '5', 10), // 0 = retry forever
 }
 
 // Reflex configuration (mutable at runtime via the setReflexes command).
@@ -153,6 +154,7 @@ let mcData = null
 let interestIds = []
 let resourceIds = []
 let shuttingDown = false
+let reconnectAttempts = 0
 // reflex state
 let reflexTimer = null
 let reflexRunning = false
@@ -180,6 +182,7 @@ function createBot () {
 
   bot.once('spawn', () => {
     botReady = true
+    reconnectAttempts = 0 // connected successfully — reset the give-up counter
     mcData = bot.registry
     interestIds = INTEREST_NAMES
       .map((n) => mcData.blocksByName[n] && mcData.blocksByName[n].id)
@@ -210,10 +213,20 @@ function createBot () {
     stopReflexes()
     log('disconnected:', reason)
     emit('end', { reason: String(reason) })
-    if (!shuttingDown && CONFIG.autoReconnect) {
-      log(`reconnecting in ${CONFIG.reconnectDelayMs}ms ...`)
-      setTimeout(createBot, CONFIG.reconnectDelayMs)
+    if (shuttingDown) return
+    if (!CONFIG.autoReconnect) {
+      log('auto-reconnect disabled — exiting so the controller can shut down.')
+      try { server.close() } catch (e) {}
+      process.exit(1)
     }
+    reconnectAttempts++
+    if (CONFIG.maxReconnect > 0 && reconnectAttempts > CONFIG.maxReconnect) {
+      log(`gave up after ${CONFIG.maxReconnect} failed reconnect attempts (world/server gone?) — exiting.`)
+      try { server.close() } catch (e) {}
+      process.exit(1)
+    }
+    log(`reconnecting in ${CONFIG.reconnectDelayMs}ms (attempt ${reconnectAttempts}${CONFIG.maxReconnect > 0 ? '/' + CONFIG.maxReconnect : ''}) ...`)
+    setTimeout(createBot, CONFIG.reconnectDelayMs)
   })
 }
 
