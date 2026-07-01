@@ -72,6 +72,15 @@ const INTEREST_NAMES = [
   'dirt', 'grass_block', 'sand', 'gravel', 'stone', 'cobblestone', 'obsidian', 'wheat',
 ]
 
+// Blocks harvestNearest will auto-gather (best/nearest of any of these).
+const RESOURCE_NAMES = [
+  'oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 'dark_oak_log', 'mangrove_log', 'cherry_log',
+  'coal_ore', 'iron_ore', 'copper_ore', 'gold_ore', 'diamond_ore', 'redstone_ore', 'lapis_ore', 'emerald_ore',
+  'deepslate_coal_ore', 'deepslate_iron_ore', 'deepslate_copper_ore', 'deepslate_gold_ore', 'deepslate_diamond_ore',
+  'deepslate_redstone_ore', 'deepslate_lapis_ore', 'ancient_debris',
+  'stone', 'cobblestone', 'sand', 'gravel', 'pumpkin', 'melon',
+]
+
 const HOSTILE_NAMES = new Set([
   'zombie', 'husk', 'drowned', 'skeleton', 'stray', 'bogged', 'creeper', 'spider', 'cave_spider',
   'witch', 'enderman', 'slime', 'silverfish', 'zombified_piglin', 'piglin', 'piglin_brute',
@@ -139,6 +148,7 @@ let bot = null
 let botReady = false
 let mcData = null
 let interestIds = []
+let resourceIds = []
 let shuttingDown = false
 // reflex state
 let reflexTimer = null
@@ -168,6 +178,9 @@ function createBot () {
     botReady = true
     mcData = bot.registry
     interestIds = INTEREST_NAMES
+      .map((n) => mcData.blocksByName[n] && mcData.blocksByName[n].id)
+      .filter((v) => v !== undefined && v !== null)
+    resourceIds = RESOURCE_NAMES
       .map((n) => mcData.blocksByName[n] && mcData.blocksByName[n].id)
       .filter((v) => v !== undefined && v !== null)
     const move = new Movements(bot)
@@ -243,6 +256,11 @@ function bestFood () {
   }
   return best
 }
+// Items stashResources should NOT deposit (tools, weapons, armor, food, essentials).
+function isKeepItem (name) {
+  if (mcData.foodsByName && mcData.foodsByName[name]) return true
+  return /pickaxe|axe|shovel|sword|hoe|bow|crossbow|shield|helmet|chestplate|leggings|boots|elytra|totem|torch|bucket|flint_and_steel|shears|ender_pearl|_bed$/.test(name)
+}
 async function equipBestTool (block) {
   const n = block.name
   let kind = null
@@ -264,7 +282,7 @@ async function manualAttack (target, maxMs) {
   try { bot.pathfinder.setGoal(null) } catch (e) {}
 }
 async function openNearestChest () {
-  const chestBlock = bot.findBlock({ matching: (b) => b && /(^|_)chest$/.test(b.name) && b.name !== 'ender_chest', maxDistance: 16 })
+  const chestBlock = bot.findBlock({ matching: (b) => b && /(^|_)chest$/.test(b.name) && b.name !== 'ender_chest', maxDistance: 48 })
   if (!chestBlock) return null
   try { await bot.pathfinder.goto(new GoalGetToBlock(chestBlock.position.x, chestBlock.position.y, chestBlock.position.z)) } catch (e) {}
   try { return await bot.openContainer(chestBlock) } catch (e) { return null }
@@ -564,6 +582,55 @@ const ACTIONS = {
     }
     try { bot.pathfinder.setGoal(null) } catch (e) {}
     return { walkedTo: visited }
+  },
+
+  // High-level "gather" primitive: auto-pick the nearest useful resource, mine it,
+  // collect the drop. The LLM does not need to choose a block name or coordinate.
+  harvestNearest: async (args) => {
+    requireBot(); stopCombat()
+    if (!resourceIds.length) return { total: 0, reason: 'no resource types known yet' }
+    const maxDistance = clamp(args.maxDistance || 32, 1, 128)
+    const count = clamp(args.count || 1, 1, 16)
+    const deadline = Date.now() + clamp(args.maxMs || 90000, 5000, 170000)
+    const harvested = {}
+    let total = 0
+    let stuckKey = null
+    for (let i = 0; i < count; i++) {
+      if (Date.now() > deadline) break
+      const block = bot.findBlock({ matching: resourceIds, maxDistance })
+      if (!block) break
+      const key = `${block.position.x},${block.position.y},${block.position.z}`
+      if (key === stuckKey) break // couldn't make progress on the nearest block
+      try {
+        if (collectPlugin && bot.collectBlock) await bot.collectBlock.collect(block)
+        else { await bot.pathfinder.goto(new GoalGetToBlock(block.position.x, block.position.y, block.position.z)); await equipBestTool(block); if (bot.canDigBlock(block)) await bot.dig(block) }
+        harvested[block.name] = (harvested[block.name] || 0) + 1
+        total++
+        stuckKey = null
+      } catch (e) { stuckKey = key }
+    }
+    try { bot.pathfinder.setGoal(null) } catch (e) {}
+    return { total, harvested }
+  },
+
+  // High-level "stash" primitive: walk to the nearest chest and deposit all
+  // gathered resources, keeping tools/food/armor.
+  stashResources: async () => {
+    requireBot(); stopCombat()
+    const chestBlock = bot.findBlock({ matching: (b) => b && /(^|_)chest$/.test(b.name) && b.name !== 'ender_chest', maxDistance: 48 })
+    if (!chestBlock) return { ok: false, reason: 'no chest within 48 blocks' }
+    try { await bot.pathfinder.goto(new GoalGetToBlock(chestBlock.position.x, chestBlock.position.y, chestBlock.position.z)) } catch (e) { return { ok: false, error: 'could not reach the chest' } }
+    let chest
+    try { chest = await bot.openContainer(chestBlock) } catch (e) { return { ok: false, error: 'could not open the chest' } }
+    const deposited = {}
+    const items = bot.inventory.items().map((it) => ({ type: it.type, name: it.name, count: it.count }))
+    try {
+      for (const it of items) {
+        if (isKeepItem(it.name)) continue
+        try { await chest.deposit(it.type, null, it.count); deposited[it.name] = (deposited[it.name] || 0) + it.count } catch (e) { /* chest full / can't deposit this one */ }
+      }
+    } finally { try { chest.close() } catch (e) {} }
+    return { deposited, at: vec(chestBlock.position) }
   },
 
   attack: async (args) => {

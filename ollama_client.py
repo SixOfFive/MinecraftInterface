@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -41,7 +42,7 @@ class OllamaClient:
     def __init__(
         self,
         url: str = "http://localhost:11434",
-        model: str = "qwen2.5:7b",
+        model: str = "qwen3:4b",
         temperature: float = 0.3,
         keep_alive: str = "30m",
         num_predict: int = 512,
@@ -133,6 +134,8 @@ def _parse_json_object(text: str) -> dict:
     and fall back to slicing the outermost braces if the model wandered.
     """
     text = (text or "").strip()
+    # Reasoning models (e.g. qwen3) may prefix a <think>...</think> trace — drop it.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     if text.startswith("```"):
         text = text.strip("`")
         if "\n" in text:

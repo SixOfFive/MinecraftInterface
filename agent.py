@@ -26,6 +26,7 @@ ACTION_NAMES = [
     "none", "chat", "goto", "gotoPlayer", "follow", "stop", "lookAt",
     "mine", "place", "collect", "attack", "equip", "drop",
     "eat", "flee", "sleep", "craft", "depositChest", "withdrawChest",
+    "harvestNearest", "stashResources",
 ]
 
 # Flat schema — small local models handle it far better than nested args.
@@ -76,6 +77,8 @@ ACTIONS (set "action" plus the fields it needs):
 - mine — find and dig the nearest block(s) of a type. Fields: name (e.g. "oak_log"), optional count.
 - place — place a block from inventory at an EMPTY (air) coordinate. Fields: name, x, y, z.
 - collect — walk over nearby dropped items to pick them up.
+- harvestNearest — AUTOMATICALLY find, walk to, mine, and collect the nearest useful resource (logs, ores, stone, sand...). You do NOT pick the block or coordinate — it chooses the best one nearby. Optional count. This is the easy way to gather materials.
+- stashResources — walk to the nearest chest (within 48 blocks) and deposit ALL your gathered resources, keeping your tools, food, and armor. Use this to store loot or whenever told to put things in a chest.
 - attack — attack a target. Field: target = a player username, a mob name, or "hostile".
 - equip — equip an item. Fields: name, optional dest.
 - drop — drop items. Fields: name, optional count.
@@ -87,7 +90,7 @@ ACTIONS (set "action" plus the fields it needs):
 
 RULES:
 - If there is no goal and no one is talking to you, choose action "none".
-- To gather a resource, use "mine" on the matching block in nearbyBlocks, then "collect" the drops. Don't just follow a player when the goal needs an action.
+- To gather materials, prefer "harvestNearest" — it finds, walks to, mines, and collects the best nearby resource for you, so don't overthink which block (use "mine" only for one specific block type). To store what you gathered, or whenever the goal says to deposit/put things in a chest, use "stashResources" — it walks to the chest and deposits for you; do this when your inventory is filling up. Don't just follow a player when the goal needs an action.
 - If an action FAILED (e.g. placed:false, arrived:false, mined:0, or an ANTI-LOOP warning appears), do something DIFFERENT next — a new action, new coordinates, or ask the player. Do not repeat a failing action.
 - ALWAYS include exactly these fields: "thought" (brief reasoning), "action" (one name above), and "goal_complete" (true/false), plus only the extra fields the chosen action needs.
 - Output a RAW JSON object only — no markdown, no code fences, no text before or after it.
@@ -157,7 +160,8 @@ class Agent:
     # -- action dispatch --------------------------------------------------
     _TIMEOUTS = {"goto": 120, "gotoPlayer": 120, "follow": 15, "mine": 180, "place": 60,
                  "collect": 90, "lookAt": 15, "sleep": 60, "craft": 60,
-                 "depositChest": 60, "withdrawChest": 60, "flee": 15}
+                 "depositChest": 60, "withdrawChest": 60, "flee": 15,
+                 "harvestNearest": 180, "stashResources": 120}
 
     def _command_for(self, d: dict) -> Optional[tuple[str, dict]]:
         action = d.get("action", "none")
@@ -182,6 +186,10 @@ class Agent:
             return ("place", _pick(d, "name", "x", "y", "z"))
         if action == "collect":
             return ("collect", _pick(d, "maxDistance"))
+        if action == "harvestNearest":
+            return ("harvestNearest", _pick(d, "count", "maxDistance"))
+        if action == "stashResources":
+            return ("stashResources", {})
         if action == "attack":
             return ("attack", _pick(d, "target"))
         if action == "equip":
@@ -227,6 +235,10 @@ class Agent:
             return result.get("engaged") is not False
         if action == "collect":
             return (result.get("walkedTo") or 0) > 0
+        if action == "harvestNearest":
+            return (result.get("total") or 0) > 0
+        if action == "stashResources":
+            return result.get("ok", True) is not False
         if action == "chat":
             return result.get("sent") is not False
         if action == "eat":

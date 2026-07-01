@@ -30,10 +30,12 @@ BOT_DIR = Path(__file__).resolve().parent / "bot"
 JOB_PRESETS = {
     "guard": "Guard this spot. Stay within ~8 blocks of where you are now and attack any hostile mobs that approach. Do not wander far.",
     "patrol": "Patrol the nearby area: keep walking around and attack any hostile mobs you see.",
-    "lumberjack": "Chop wood continuously: repeatedly mine the nearest log (oak_log, birch_log, spruce_log, etc.) and collect the drops.",
-    "miner": "Mine continuously: dig the nearest ore or stone you can see and collect the drops. Stay safe.",
+    "harvest": "Gather resources continuously: use harvestNearest to mine and collect the nearest useful block. When your inventory is getting full, use stashResources to deposit everything into a chest, then keep gathering.",
+    "stash": "Deposit your loot: use stashResources to walk to the nearest chest and store all your gathered resources.",
+    "lumberjack": "Chop wood continuously: mine the nearest log (oak_log, birch_log, etc.) and collect the drops. When your inventory fills up, use stashResources to store the wood, then keep going.",
+    "miner": "Mine continuously: dig the nearest ore or stone and collect the drops. When your inventory fills up, use stashResources to store it. Stay safe.",
     "defend": "Follow {arg} closely and protect them: attack any hostile mobs near them.",
-    "gather": "Gather {arg}: repeatedly mine the nearest {arg} and collect it.",
+    "gather": "Gather {arg}: repeatedly mine the nearest {arg} and collect it. Use stashResources to store it when your inventory fills up.",
 }
 
 
@@ -82,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bridge-host", default=env("BRIDGE_HOST", "127.0.0.1"))
     p.add_argument("--bridge-port", type=int, default=int(env("BRIDGE_PORT", "25585")))
     p.add_argument("--ollama-url", default=env("OLLAMA_URL", "http://localhost:11434"))
-    p.add_argument("--model", default=env("OLLAMA_MODEL", "qwen2.5:7b"))
+    p.add_argument("--model", default=env("OLLAMA_MODEL", "qwen3:4b"))
     p.add_argument("--temperature", type=float, default=float(env("OLLAMA_TEMP", "0.3")))
     p.add_argument("--tick", type=float, default=float(env("AGENT_TICK", "2.0")),
                    help="Seconds between think-steps while pursuing a goal.")
@@ -277,7 +279,7 @@ def print_help() -> None:
         "\nConsole commands:\n"
         "  goal <text>        one-off task (or just type the text)\n"
         "  job <name|text>    standing job that never times out:\n"
-        "                       guard | patrol | lumberjack | miner | defend <player> | gather <block>\n"
+        "                       guard | patrol | harvest | stash | lumberjack | miner | defend <player> | gather <block>\n"
         "  reflex on|off <x>  toggle a reflex: eat|defend|pickup|wander|greet  (no arg = show autopilot)\n"
         "  owner <player>     set who the bot protects / flees toward\n"
         "  heartbeat <secs>   auto-resume the last goal/job after N idle seconds (0 = off)\n"
