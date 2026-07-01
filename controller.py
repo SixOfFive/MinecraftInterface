@@ -95,6 +95,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--narrate", action=argparse.BooleanOptionalAction,
                    default=env("AGENT_NARRATE", "1") not in ("0", "false", "False", "off"),
                    help="Announce activity changes in chat (default on; --no-narrate to disable).")
+    p.add_argument("--max-bot-restarts", type=int, default=int(env("AGENT_MAX_BOT_RESTARTS", "20")),
+                   help="Relaunch bot.js after a crash up to N times (0 = unlimited).")
     p.add_argument("--goal", default=None, help="Initial goal to pursue on startup.")
     p.add_argument("--no-warmup", action="store_true", help="Skip preloading the model at startup.")
     p.add_argument("--external-bot", action="store_true",
@@ -187,11 +189,59 @@ async def status_ticker(bridge: BotBridge, agent: Agent, shutdown: asyncio.Event
         )
 
 
-async def watch_proc(proc: asyncio.subprocess.Process, shutdown: asyncio.Event) -> None:
-    await proc.wait()
-    if not shutdown.is_set():
-        print(f"[controller] bot.js exited (code {proc.returncode}); shutting down.", flush=True)
-        shutdown.set()
+async def supervise_bot(cfg: argparse.Namespace, bridge: BotBridge, shutdown: asyncio.Event,
+                        holder: dict, max_restarts: int) -> None:
+    """Spawn bot.js, connect the bridge, and relaunch it on crash so the session survives.
+
+    Only CRASHES relaunch. A deliberate exit — code 0 (clean shutdown) or 1 (gave up
+    reconnecting to MC / bridge port in use) — shuts the controller down instead, since
+    relaunching wouldn't help. On a crash (e.g. OOM abort = 134) the goal/job (kept here
+    in the Python agent) and the server-side position/inventory mean the bot resumes.
+    """
+    restarts_left = max_restarts
+    while not shutdown.is_set():
+        cfg.bridge_port = _find_free_port(cfg.bridge_host, cfg.bridge_port)
+        bridge.host, bridge.port = cfg.bridge_host, cfg.bridge_port
+        print(f"[controller] launching bot.js (bridge {cfg.bridge_host}:{cfg.bridge_port}) ...", flush=True)
+        proc = await spawn_bot(cfg)
+        holder["p"] = proc
+        pipe_task = asyncio.create_task(pipe_output(proc))
+
+        # Connect the bridge to this bot.js, aborting the wait if it dies during startup.
+        connect_task = asyncio.create_task(bridge.connect())
+        while not connect_task.done():
+            if proc.returncode is not None or shutdown.is_set():
+                connect_task.cancel()
+                break
+            await asyncio.sleep(0.25)
+        try:
+            await connect_task
+        except (BotError, asyncio.CancelledError):
+            pass
+
+        rc = await proc.wait()  # block until bot.js exits
+        pipe_task.cancel()
+        try:
+            await bridge.close()
+        except Exception:
+            pass
+
+        if shutdown.is_set():
+            break
+        if rc in (0, 1):  # deliberate exit — not a crash
+            print(f"[controller] bot.js exited (code {rc}) — not a crash; shutting down.", flush=True)
+            shutdown.set()
+            break
+        if max_restarts > 0 and restarts_left <= 0:
+            print(f"[controller] bot.js crashed (code {rc}) and hit the restart limit — shutting down.", flush=True)
+            shutdown.set()
+            break
+        restarts_left -= 1
+        left = "unlimited" if max_restarts <= 0 else restarts_left
+        print(f"[controller] bot.js crashed (code {rc}) — relaunching in 3s; it rejoins where it left off "
+              f"({left} restarts left).", flush=True)
+        await asyncio.sleep(3)
+    holder["p"] = None
 
 
 def start_stdin_reader(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue) -> None:
@@ -372,70 +422,51 @@ async def main() -> None:
         print(f"[warn] could not reach Ollama at {cfg.ollama_url}: {e}")
 
     print(f"[controller] bot name: {cfg.username}  (owner: {cfg.owner or 'none'})", flush=True)
-    proc = None
-    if not cfg.external_bot:
-        chosen = _find_free_port(cfg.bridge_host, cfg.bridge_port)
-        if chosen != cfg.bridge_port:
-            print(f"[controller] bridge port {cfg.bridge_port} busy — using {chosen} (another bot running?).")
-        cfg.bridge_port = chosen
     bridge = BotBridge(cfg.bridge_host, cfg.bridge_port)
     shutdown = asyncio.Event()
+    agent = Agent(bridge, llm, username=cfg.username, tick=cfg.tick,
+                  heartbeat=cfg.heartbeat, narrate=cfg.narrate)
+    proc_holder: dict = {"p": None}
     tasks: list[asyncio.Task] = []
 
+    def on_event(event: str, data: dict) -> None:
+        if event == "chat":
+            print(f"[mc] <{data.get('username')}> {data.get('message')}", flush=True)
+            agent.note_chat(data.get("username", "?"), data.get("message", ""))
+        elif event == "spawn":
+            caps = data.get("capabilities") or {}
+            print(f"[controller] bot spawned as {data.get('username')} (v{data.get('version')}) "
+                  f"[pvp={caps.get('pvp')}, collect={caps.get('collect')}]", flush=True)
+        elif event == "auto":
+            extra = {k: v for k, v in data.items() if k != "kind"}
+            print(f"[auto] {data.get('kind')} {extra or ''}".rstrip(), flush=True)
+        elif event in ("kicked", "end", "error", "death"):
+            print(f"[mc] {event}: {data}", flush=True)
+
+    bridge.on_event(on_event)
+
     try:
-        # 2) Bring up the Node bot.
-        if not cfg.external_bot:
+        # Bring up the Node bot. The supervisor spawns it, connects the bridge, and
+        # relaunches on crash so the session survives — the goal/job lives here in Python
+        # and the MC server restores position/inventory, so the bot resumes where it left off.
+        if cfg.external_bot:
+            print(f"[controller] connecting to external bot bridge {cfg.bridge_host}:{cfg.bridge_port} ...", flush=True)
+            await bridge.connect()
+        else:
             await ensure_bot_deps(cfg)
-            proc = await spawn_bot(cfg)
-            tasks.append(asyncio.create_task(pipe_output(proc)))
-            tasks.append(asyncio.create_task(watch_proc(proc, shutdown)))
+            tasks.append(asyncio.create_task(
+                supervise_bot(cfg, bridge, shutdown, proc_holder, cfg.max_bot_restarts)))
 
-        # 3) Connect to the control bridge, aborting if bot.js dies during startup.
-        print(f"[controller] connecting to bot bridge {cfg.bridge_host}:{cfg.bridge_port} ...", flush=True)
-        connect_task = asyncio.create_task(bridge.connect())
-        while not connect_task.done():
-            if proc is not None and proc.returncode is not None:
-                connect_task.cancel()
-                raise SystemExit(
-                    f"bot.js exited early (code {proc.returncode}); "
-                    f"bridge port {cfg.bridge_port} may already be in use.")
-            await asyncio.sleep(0.25)
-        await connect_task  # re-raises BotError if unreachable
-
-        agent = Agent(bridge, llm, username=cfg.username, tick=cfg.tick,
-                      heartbeat=cfg.heartbeat, narrate=cfg.narrate)
-
-        def on_event(event: str, data: dict) -> None:
-            if event == "chat":
-                print(f"[mc] <{data.get('username')}> {data.get('message')}", flush=True)
-                agent.note_chat(data.get("username", "?"), data.get("message", ""))
-            elif event == "spawn":
-                caps = data.get("capabilities") or {}
-                print(f"[controller] bot spawned as {data.get('username')} (v{data.get('version')}) "
-                      f"[pvp={caps.get('pvp')}, collect={caps.get('collect')}]", flush=True)
-            elif event == "auto":
-                extra = {k: v for k, v in data.items() if k != "kind"}
-                print(f"[auto] {data.get('kind')} {extra or ''}".rstrip(), flush=True)
-            elif event in ("kicked", "end", "error", "death"):
-                print(f"[mc] {event}: {data}", flush=True)
-
-        bridge.on_event(on_event)
-
-        # 4) Wait (briefly) for spawn so the first goal doesn't fire into a void.
+        # Wait (briefly) for the first spawn so the first goal doesn't fire into a void.
         print("[controller] waiting for the bot to spawn (is your world/server running?) ...", flush=True)
-        for _ in range(60):
+        for _ in range(120):
             if bridge.ready or shutdown.is_set():
                 break
             await asyncio.sleep(0.5)
-        if not bridge.ready:
-            print("[controller] not spawned yet — the bot will keep trying to connect. "
-                  "Open your world to LAN (and set --mc-port to the port it prints), or start a server.", flush=True)
+        if not bridge.ready and not shutdown.is_set():
+            print("[controller] not spawned yet — it'll keep trying. Open your world to LAN "
+                  "(set --mc-port to the port it prints), or start a server.", flush=True)
 
-        if cfg.owner:
-            try:
-                await bridge.send("setOwner", username=cfg.owner, timeout=15)
-            except BotError:
-                pass
         if cfg.goal:
             agent.set_goal(cfg.goal)
 
@@ -448,22 +479,20 @@ async def main() -> None:
         await shutdown.wait()
     finally:
         print("[controller] shutting down ...", flush=True)
-        try:
-            agent.stop()  # type: ignore[possibly-undefined]
-        except NameError:
-            pass
+        agent.stop()
         for t in tasks:
             t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await bridge.close()
-        if proc and proc.returncode is None:
+        p = proc_holder.get("p")
+        if p and p.returncode is None:
             try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5)
+                p.terminate()
+                await asyncio.wait_for(p.wait(), timeout=5)
             except (ProcessLookupError, asyncio.TimeoutError):
                 try:
-                    proc.kill()
+                    p.kill()
                 except ProcessLookupError:
                     pass
 

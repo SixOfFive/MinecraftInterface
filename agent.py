@@ -124,6 +124,7 @@ class Agent:
         self.heartbeat = heartbeat  # >0: re-issue last directive after this many idle seconds
         self.narrate = narrate  # announce activity changes in chat
         self._last_narration = ""
+        self._brain_offline = False  # True while the LLM/Ollama is unreachable
         self.max_goal_steps = max_goal_steps
         self.verbose = verbose
 
@@ -303,7 +304,19 @@ class Agent:
             decision = await self.llm.chat(messages, schema=ACTION_SCHEMA)
         except OllamaError as e:
             self._log(f"(LLM error: {e})")
+            if not self._brain_offline:  # brain just went unreachable — tell the world once
+                self._brain_offline = True
+                try:
+                    await self.bridge.send("chat", message="My soul has escaped my body.", timeout=15)
+                except BotError:
+                    pass
             return
+        if self._brain_offline:  # brain recovered
+            self._brain_offline = False
+            try:
+                await self.bridge.send("chat", message="My soul returns to my body.", timeout=15)
+            except BotError:
+                pass
 
         thought = str(decision.get("thought", "")).strip()
         say = str(decision.get("say", "")).strip()
