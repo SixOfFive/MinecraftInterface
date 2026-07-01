@@ -292,9 +292,21 @@ const TOOL_SPECS = {
   wooden_sword: { base: 'planks', baseCount: 2, sticks: 1 },
   wooden_axe: { base: 'planks', baseCount: 3, sticks: 2 },
   stone_pickaxe: { base: 'cobblestone', baseCount: 3, sticks: 2 },
-  stone_sword: { base: 'cobblestone', baseCount: 1, sticks: 1 },
+  stone_sword: { base: 'cobblestone', baseCount: 2, sticks: 1 },
   stone_axe: { base: 'cobblestone', baseCount: 3, sticks: 2 },
+  iron_pickaxe: { base: 'iron_ingot', baseCount: 3, sticks: 2 },
+  iron_sword: { base: 'iron_ingot', baseCount: 2, sticks: 1 },
+  iron_axe: { base: 'iron_ingot', baseCount: 3, sticks: 2 },
 }
+// Iron armor — crafted from iron_ingot on a table, then auto-equipped. Ordered
+// by protection so a bot short on iron still gets the most-valuable piece first.
+const ARMOR_SPECS = {
+  iron_chestplate: { iron: 8, slot: 'torso', key: 'torso' },
+  iron_leggings: { iron: 7, slot: 'legs', key: 'legs' },
+  iron_helmet: { iron: 5, slot: 'head', key: 'head' },
+  iron_boots: { iron: 4, slot: 'feet', key: 'feet' },
+}
+const ARMOR_PRIORITY = ['iron_chestplate', 'iron_leggings', 'iron_helmet', 'iron_boots']
 const TOOL_KINDS = ['netherite', 'diamond', 'iron', 'stone', 'golden', 'wooden']
 
 function invCount (name) { return bot.inventory.items().filter((i) => i.name === name).reduce((a, i) => a + i.count, 0) }
@@ -360,6 +372,10 @@ function gearSummary () {
   return {
     pickaxe: toolTier('pickaxe'), sword: toolTier('sword'), axe: toolTier('axe'), shovel: toolTier('shovel'),
     logs: invCountRe(/_log$/), planks: invCountRe(/_planks$/), sticks: invCount('stick'), cobblestone: invCount('cobblestone'),
+    iron: invCount('iron_ingot'), rawIron: invCount('raw_iron') + invCount('iron_ore'),
+    coal: invCount('coal') + invCount('charcoal'),
+    furnace: !!nearbyFurnace() || invCount('furnace') > 0,
+    armor: { head: haveIronPlus('helmet'), torso: haveIronPlus('chestplate'), legs: haveIronPlus('leggings'), feet: haveIronPlus('boots') },
   }
 }
 async function makeTool (name) {
@@ -367,6 +383,8 @@ async function makeTool (name) {
   if (!spec) return { ok: false, reason: `don't know how to make ${name}` }
   if (spec.base === 'planks') {
     if (!await ensurePlanks(spec.baseCount)) return { ok: false, need: 'oak_log', reason: 'need wood — harvest logs' }
+  } else if (spec.base === 'iron_ingot') {
+    if (invCount('iron_ingot') < spec.baseCount) return { ok: false, need: 'raw_iron', reason: 'need iron ingots — smelt raw_iron in a furnace (gearUp)' }
   } else if (invCount('cobblestone') < spec.baseCount) {
     return { ok: false, need: 'stone', reason: 'need cobblestone — mine stone (harvestNearest)' }
   }
@@ -375,6 +393,153 @@ async function makeTool (name) {
   if (!table) return { ok: false, need: 'oak_log', reason: 'need a crafting table (and wood to make it)' }
   return await craftOne(name, table) ? { ok: true, crafted: name } : { ok: false, reason: `could not craft ${name}` }
 }
+
+// --- iron age: furnace, smelting, armor -----------------------------------
+function nearbyFurnace () {
+  return bot.findBlock({ matching: (b) => b && (b.name === 'furnace' || b.name === 'blast_furnace'), maxDistance: 6 })
+}
+// Fuel preference: coal-family first (each smelts 8 and isn't needed for crafting),
+// then wood as a last resort. Note wood fuel competes with the ladder's need for
+// sticks/planks, so gearUp reports need:'oak_log' if it later runs short.
+function findFuelItem () {
+  const prefs = [/^coal$/, /^charcoal$/, /^coal_block$/, /_log$/, /_wood$/, /_planks$/, /^stick$/]
+  for (const re of prefs) { const it = bot.inventory.items().find((i) => re.test(i.name)); if (it) return it }
+  return null
+}
+function emptySlotCount () {
+  try { if (typeof bot.inventory.emptySlotCount === 'function') return bot.inventory.emptySlotCount() } catch (e) {}
+  return (bot.inventory.slots || []).filter((s) => !s).length
+}
+// Best armor tier the bot has for a slot (0 = none). Scans inventory + worn armor
+// slots. gearUp uses this so it crafts iron only when a slot is worse than iron —
+// and never DOWNGRADES an existing diamond/netherite piece to iron.
+const ARMOR_TIER = { leather: 1, golden: 2, chainmail: 2, iron: 3, diamond: 4, netherite: 5 }
+function armorTierInSlot (kind) {
+  let best = 0
+  for (const s of (bot.inventory.slots || [])) {
+    if (!s) continue
+    const m = s.name.match(new RegExp(`^(\\w+?)_${kind}$`))
+    if (m && ARMOR_TIER[m[1]] != null) best = Math.max(best, ARMOR_TIER[m[1]])
+  }
+  return best
+}
+function haveIronPlus (kind) { return armorTierInSlot(kind) >= ARMOR_TIER.iron }
+// Find or build+place a furnace. Mirrors ensureTable's placement scan.
+async function ensureFurnace () {
+  let f = nearbyFurnace()
+  if (f) return f
+  let item = bot.inventory.items().find((i) => i.name === 'furnace')
+  if (!item) {
+    if (invCount('cobblestone') < 8) return null
+    const table = await ensureTable()
+    if (!table || !await craftOne('furnace', table)) return null
+    item = bot.inventory.items().find((i) => i.name === 'furnace')
+    if (!item) return null
+  }
+  try {
+    await bot.equip(item, 'hand')
+    const base = bot.entity.position.floored()
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) {
+      const ref = bot.blockAt(base.offset(dx, -1, dz))
+      const cell = bot.blockAt(base.offset(dx, 0, dz))
+      if (ref && ref.boundingBox === 'block' && cell && cell.name === 'air') {
+        try { await bot.lookAt(cell.position.offset(0.5, 0.5, 0.5)); await bot.placeBlock(ref, new Vec3(0, 1, 0)); break } catch (e) {}
+      }
+    }
+  } catch (e) {}
+  return nearbyFurnace()
+}
+// Smelt up to `maxItems` raw iron. Fail-soft: recovers input/output on timeout,
+// always closes the furnace. Blocks for the smelt (reflexes run independently).
+async function smeltIron (maxItems) {
+  const rawName = invCount('raw_iron') > 0 ? 'raw_iron' : (invCount('iron_ore') > 0 ? 'iron_ore' : null)
+  if (!rawName) return { ok: false, need: 'raw_iron', reason: 'no raw iron — mine iron_ore' }
+  const fuel = findFuelItem()
+  if (!fuel) return { ok: false, need: 'coal', reason: 'no fuel — get coal or wood' }
+  if (emptySlotCount() < 2) return { ok: false, need: 'inventory_space', reason: 'inventory full — free a slot before smelting' }
+  const fBlock = await ensureFurnace()
+  if (!fBlock) {
+    return invCount('furnace') > 0
+      ? { ok: false, need: 'space', reason: 'have a furnace but no room to place it — move to open ground' }
+      : { ok: false, need: 'cobblestone', reason: 'need a furnace (8 cobblestone)' }
+  }
+  try { await bot.pathfinder.goto(new GoalGetToBlock(fBlock.position.x, fBlock.position.y, fBlock.position.z)) } catch (e) {}
+  let furnace
+  try { furnace = await bot.openFurnace(fBlock) } catch (e) { return { ok: false, error: 'could not open furnace: ' + e.message } }
+  const before = invCount('iron_ingot')
+  try {
+    const want = Math.min(invCount(rawName), Math.max(1, maxItems || 8))
+    const rawDef = mcData.itemsByName[rawName]
+    const fuelDef = mcData.itemsByName[fuel.name]
+    const fuelPer = /coal|charcoal/.test(fuel.name) ? 8 : 1.5
+    const loadFuel = Math.min(Math.max(1, Math.ceil(want / fuelPer)), fuel.count)
+    try { await furnace.putFuel(fuelDef.id, null, loadFuel) } catch (e) {}
+    // A furnace with no input won't burn yet, so a landed fuel item stays in its
+    // slot — if it's absent here, the transfer failed. Bail before the long wait.
+    if (!furnace.fuelItem()) {
+      try { furnace.close() } catch (x) {}
+      return { ok: false, need: 'coal', reason: 'furnace would not accept fuel' }
+    }
+    try { await furnace.putInput(rawDef.id, null, want) } catch (e) {
+      try { furnace.close() } catch (x) {}
+      return { ok: false, error: 'could not load furnace: ' + e.message }
+    }
+    // Wait only as long as the loaded fuel can actually smelt (bounds a starved
+    // smelt), with a stall guard so a stuck furnace never pins the full timeout.
+    const canSmelt = Math.min(want, Math.max(1, Math.floor(loadFuel * fuelPer)))
+    const timeoutMs = Math.min(120000, canSmelt * 11000 + 12000)
+    const start = Date.now()
+    let lastOut = -1
+    let stall = 0
+    while (Date.now() - start < timeoutMs) {
+      const out = furnace.outputItem()
+      const c = out ? out.count : 0
+      if (c >= canSmelt) break
+      if (!furnace.inputItem()) break // input consumed
+      if (c === lastOut) { if (++stall >= 15) break } else { stall = 0; lastOut = c }
+      await sleep(1000)
+    }
+    try { if (furnace.outputItem()) await furnace.takeOutput() } catch (e) {}
+    try { if (furnace.inputItem()) await furnace.takeInput() } catch (e) {} // recover un-smelted raw
+  } catch (e) {
+    try { furnace.close() } catch (x) {}
+    return { ok: false, error: e.message }
+  }
+  try { furnace.close() } catch (e) {}
+  const smelted = invCount('iron_ingot') - before
+  if (smelted > 0) return { ok: true, smelted, iron: invCount('iron_ingot') }
+  // Nothing reached the inventory — a full pack means the ingots are stranded in
+  // the furnace (takeOutput failed), which is a distinct, actionable failure.
+  return emptySlotCount() < 1
+    ? { ok: false, need: 'inventory_space', reason: 'smelted iron but inventory full — free a slot to collect it', iron: invCount('iron_ingot') }
+    : { ok: false, reason: 'smelting produced nothing (out of fuel?)', iron: invCount('iron_ingot') }
+}
+// Craft one armor piece and auto-equip it.
+async function makeArmor (name) {
+  const spec = ARMOR_SPECS[name]
+  if (!spec) return { ok: false, reason: `don't know armor ${name}` }
+  if (invCount('iron_ingot') < spec.iron) return { ok: false, need: 'raw_iron', reason: `need ${spec.iron} iron for ${name}` }
+  const table = await ensureTable()
+  if (!table) return { ok: false, need: 'oak_log', reason: 'need a crafting table' }
+  if (!await craftOne(name, table)) return { ok: false, reason: `could not craft ${name}` }
+  const item = bot.inventory.items().find((i) => i.name === name)
+  if (item) { try { await bot.equip(item, spec.slot) } catch (e) {} }
+  return { ok: true, crafted: name, equipped: !!item }
+}
+// When gearUp can't act, tell the caller what raw material to gather next.
+function nextGearNeed (g) {
+  const armorLeft = ['torso', 'legs', 'head', 'feet'].filter((k) => !g.armor[k])
+  const toolsLeft = g.pickaxe === 'stone' || g.sword === 'stone'
+  if (!toolsLeft && armorLeft.length === 0) return { done: true, message: 'fully geared (iron tools + armor)', gear: g }
+  if (g.rawIron > 0 && !g.furnace && g.cobblestone < 8) return { done: false, need: 'cobblestone', message: 'have raw iron — mine 8 cobblestone to build a furnace', gear: g }
+  if (g.rawIron > 0 && !findFuelItem()) return { done: false, need: 'coal', message: 'have raw iron — need fuel (coal or wood) to smelt', gear: g }
+  if (g.iron === 0 && g.rawIron === 0) {
+    if (!g.furnace && g.cobblestone < 8) return { done: false, need: 'cobblestone', message: 'to reach iron gear: mine cobblestone (furnace) then iron_ore', gear: g }
+    return { done: false, need: 'raw_iron', message: 'mine iron_ore to smelt into iron gear', gear: g }
+  }
+  return { done: false, need: 'raw_iron', message: 'gather more iron_ore to finish gear', gear: g }
+}
+
 async function equipBestTool (block) {
   const n = block.name
   let kind = null
@@ -816,20 +981,54 @@ const ACTIONS = {
     try { await bot.craft(recipes[0], count, table || undefined); return { crafted: true, item: name, count } } catch (e) { return { crafted: false, error: e.message } }
   },
 
-  // Self-analyze gear and craft the next tool in the progression (wooden pickaxe
-  // -> stone pickaxe -> stone sword -> stone axe). Reports what raw material to
-  // gather if short, so the caller can harvestNearest and call gearUp again.
+  // Self-analyze gear and take ONE step up the ladder per call:
+  // wooden pickaxe -> stone tools -> furnace -> smelt iron -> iron pickaxe/sword
+  // -> iron armor. Reports what raw material to gather if short, so the caller
+  // can harvestNearest (wood/stone/iron_ore/coal) and call gearUp again.
   gearUp: async () => {
     requireBot(); stopCombat()
     const g = gearSummary()
+
+    // 1) wood + stone tool ladder
     let target = null
     if (!g.pickaxe) target = 'wooden_pickaxe'
     else if (g.pickaxe === 'wooden') target = 'stone_pickaxe'
     else if (!g.sword) target = 'stone_sword'
     else if (!g.axe) target = 'stone_axe'
-    if (!target) return { done: true, message: 'fully geared (stone tools)', gear: g }
-    const res = await makeTool(target)
-    return { target, ...res, gear: gearSummary() }
+    if (target) { const res = await makeTool(target); return { stage: 'stone-tools', target, ...res, gear: gearSummary() } }
+
+    // 2) build a furnace once we have cobblestone (and don't already have one)
+    if (!g.furnace && g.cobblestone >= 8) {
+      const f = await ensureFurnace()
+      if (f) return { stage: 'furnace', target: 'furnace', ok: true, gear: gearSummary() }
+      // ensureFurnace crafts before placing, so a furnace item now on hand means
+      // the craft worked but there was nowhere to place it — don't ask for cobble.
+      return invCount('furnace') > 0
+        ? { stage: 'furnace', target: 'furnace', ok: false, need: 'space', reason: 'crafted a furnace but no room to place it — move to open ground', gear: gearSummary() }
+        : { stage: 'furnace', target: 'furnace', ok: false, need: 'cobblestone', reason: 'could not build a furnace', gear: gearSummary() }
+    }
+
+    // 3) smelt raw iron into ingots
+    if (g.rawIron > 0 && (g.furnace || g.cobblestone >= 8)) {
+      const res = await smeltIron(8)
+      return { stage: 'smelt', ...res, gear: gearSummary() }
+    }
+
+    // 4) upgrade pickaxe/sword to iron
+    if (g.pickaxe === 'stone' && g.iron >= 3) { const res = await makeTool('iron_pickaxe'); return { stage: 'iron-tools', target: 'iron_pickaxe', ...res, gear: gearSummary() } }
+    if (g.sword === 'stone' && g.iron >= 2) { const res = await makeTool('iron_sword'); return { stage: 'iron-tools', target: 'iron_sword', ...res, gear: gearSummary() } }
+
+    // 5) craft the best armor piece we can afford and don't already have
+    for (const name of ARMOR_PRIORITY) {
+      const spec = ARMOR_SPECS[name]
+      if (!g.armor[spec.key] && g.iron >= spec.iron) {
+        const res = await makeArmor(name)
+        return { stage: 'armor', target: name, ...res, gear: gearSummary() }
+      }
+    }
+
+    // 6) nothing craftable right now — report the next material to gather
+    return nextGearNeed(g)
   },
 
   depositChest: async (args) => {
