@@ -1,10 +1,14 @@
 """controller.py — the entrypoint.
 
-Spawns the Node Mineflayer bot (bot.js), connects to its control bridge, wires
-Minecraft chat into the LLM agent, and gives you a small console to set goals.
+Spawns one or more Node Mineflayer bots (bot.js), connects to each control
+bridge, wires Minecraft chat into the LLM agent, and gives you a small console
+to set goals. Console commands apply to ALL bots at once.
 
 Run:  python controller.py --goal "follow me and say hi"
+      python controller.py --bot 3 --mc-port 12345      # three bots at once
 Everything is configurable by flag or environment variable; see --help.
+
+Ctrl-C stops every bot cleanly — see the process-leak safety section below.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import json
 import os
 import random
 import shutil
+import signal
 import socket
 import sys
 import threading
@@ -41,8 +46,126 @@ JOB_PRESETS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Process-leak safety (Windows). Put every bot.js child in a Job Object flagged
+# KILL_ON_JOB_CLOSE. The controller holds the only handle to that job, so if the
+# controller exits for ANY reason — clean quit, Ctrl-C, uncaught crash, even
+# taskkill — Windows closes the handle and terminates every child with it. That
+# guarantees no orphaned `node` processes are left behind. All fail-soft: if the
+# ctypes calls fail we simply fall back to the explicit terminate-on-shutdown.
+# ---------------------------------------------------------------------------
+_JOB_HANDLE = None
+
+
+def _win_job_setup() -> None:
+    global _JOB_HANDLE
+    if os.name != "nt" or _JOB_HANDLE is not None:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
+                        ("WriteOperationCount", ctypes.c_ulonglong),
+                        ("OtherOperationCount", ctypes.c_ulonglong),
+                        ("ReadTransferCount", ctypes.c_ulonglong),
+                        ("WriteTransferCount", ctypes.c_ulonglong),
+                        ("OtherTransferCount", ctypes.c_ulonglong)]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                        ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                        ("IoInfo", IO_COUNTERS),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):  # 9 = ExtendedLimitInformation
+            k32.CloseHandle(job)
+            return
+        _JOB_HANDLE = job
+    except Exception:
+        _JOB_HANDLE = None
+
+
+def _assign_to_job(pid: int) -> None:
+    if os.name != "nt" or _JOB_HANDLE is None:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        handle = k32.OpenProcess(0x0100 | 0x0001, False, pid)  # SET_QUOTA | TERMINATE
+        if not handle:
+            return
+        try:
+            k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+            k32.AssignProcessToJobObject(_JOB_HANDLE, handle)
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:
+        pass
+
+
+def install_signal_handlers(loop: asyncio.AbstractEventLoop, shutdown: asyncio.Event, holders: list) -> None:
+    """First Ctrl-C / SIGTERM asks for a graceful shutdown (which terminates every
+    bot.js). A second one force-exits — killing tracked children first, and the
+    Job Object reaps anything else as the process dies. Prevents leaked children."""
+    state = {"n": 0}
+
+    def handler(signum, frame):  # noqa: ANN001
+        state["n"] += 1
+        if state["n"] == 1:
+            print("\n[controller] Ctrl-C — stopping all bots (press again to force) ...", flush=True)
+            try:
+                loop.call_soon_threadsafe(shutdown.set)
+            except RuntimeError:
+                shutdown.set()
+        else:
+            print("\n[controller] force exit — killing children.", flush=True)
+            for h in holders:
+                p = h.get("p")
+                if p and p.returncode is None:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+            os._exit(1)  # Job Object closes with the process and reaps any stragglers
+
+    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            pass  # not the main thread / unsupported on this platform
+
+
 def _find_free_port(host: str, start: int, limit: int = 20) -> int:
-    """First bindable TCP port at/after `start` — lets a 2nd bot auto-pick a bridge port."""
+    """First bindable TCP port at/after `start` — lets each bot auto-pick a bridge port."""
     for p in range(start, start + limit):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
@@ -77,14 +200,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mc-host", default=env("MC_HOST", "127.0.0.1"))
     p.add_argument("--mc-port", type=int, default=int(env("MC_PORT", "25565")),
                    help="Server port. For an Open-to-LAN world, use the port printed in the game chat.")
+    p.add_argument("--bot", "--bots", type=int, dest="bots", default=int(env("BOT_COUNT", "1")),
+                   help="How many bots to spawn from this one process (default 1). Ctrl-C stops them all.")
     p.add_argument("--username", default=env("MC_USERNAME", ""),
-                   help="Bot player name (unique per bot). Blank = random ClaudeBot###.")
+                   help="Bot player name. Blank = random ClaudeBot###. With --bot N>1 it's a name prefix.")
     p.add_argument("--auth", default=env("MC_AUTH", "offline"), choices=["offline", "microsoft"])
     p.add_argument("--owner", default=env("MC_OWNER", ""), help="Player the bot protects / flees toward.")
     p.add_argument("--mc-version", default=env("MC_VERSION", ""),
                    help="Blank = auto-detect (recommended). If pinning, use a supported anchor (e.g. 1.21.8).")
     p.add_argument("--bridge-host", default=env("BRIDGE_HOST", "127.0.0.1"))
-    p.add_argument("--bridge-port", type=int, default=int(env("BRIDGE_PORT", "25585")))
+    p.add_argument("--bridge-port", type=int, default=int(env("BRIDGE_PORT", "25585")),
+                   help="Base control-bridge port; bot i uses base+i (each auto-bumps if taken).")
     p.add_argument("--ollama-url", default=env("OLLAMA_URL", DEFAULT_OLLAMA_URL))
     p.add_argument("--model", default=env("OLLAMA_MODEL", DEFAULT_MODEL))
     p.add_argument("--temperature", type=float, default=float(env("OLLAMA_TEMP", "0.3")))
@@ -102,13 +228,47 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--goal", default=None, help="Initial goal to pursue on startup.")
     p.add_argument("--no-warmup", action="store_true", help="Skip preloading the model at startup.")
     p.add_argument("--external-bot", action="store_true",
-                   help="Don't spawn bot.js; connect to an already-running bridge.")
+                   help="Don't spawn bot.js; connect to an already-running bridge (single bot only).")
     p.add_argument("--no-install", action="store_true", help="Skip auto 'npm install' in bot/.")
     p.add_argument("--list-models", action="store_true", help="List local Ollama models and exit.")
     args = p.parse_args()
+    args.username_explicit = bool(args.username)
     if not args.username:
         args.username = f"ClaudeBot{random.randint(100, 999)}"  # unique-ish per run
+    if args.bots < 1:
+        args.bots = 1
+    if args.external_bot and args.bots > 1:
+        print("[warn] --external-bot supports a single bot; forcing --bot 1.", flush=True)
+        args.bots = 1
     return args
+
+
+def make_bot_names(cfg: argparse.Namespace) -> list[str]:
+    """Distinct player names for each bot (MC needs unique names in a world)."""
+    if cfg.bots == 1:
+        return [cfg.username]
+    if cfg.username_explicit:  # honor an explicit base by suffixing an index
+        return [f"{cfg.username}{i + 1}"[:16] for i in range(cfg.bots)]
+    names: list[str] = []
+    seen: set[str] = set()
+    while len(names) < cfg.bots:
+        nm = f"ClaudeBot{random.randint(100, 999)}"
+        if nm not in seen:
+            seen.add(nm)
+            names.append(nm)
+    return names
+
+
+class BotUnit:
+    """One bot: its own config, control bridge, LLM agent, and child process."""
+
+    def __init__(self, index: int, cfg: argparse.Namespace, bridge: BotBridge, agent: Agent, label: str):
+        self.index = index
+        self.cfg = cfg
+        self.bridge = bridge
+        self.agent = agent
+        self.label = label
+        self.proc_holder: dict = {"p": None}
 
 
 async def ensure_bot_deps(cfg: argparse.Namespace) -> None:
@@ -141,25 +301,37 @@ async def spawn_bot(cfg: argparse.Namespace) -> asyncio.subprocess.Process:
         "BRIDGE_HOST": cfg.bridge_host,
         "BRIDGE_PORT": str(cfg.bridge_port),
     })
-    return await asyncio.create_subprocess_exec(
+    # Isolate children from the console's Ctrl-C (we drive their lifecycle
+    # explicitly); on POSIX a new session gives us a killable process group.
+    kwargs: dict = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x00000200  # CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    proc = await asyncio.create_subprocess_exec(
         node, "--expose-gc", "bot.js", cwd=str(BOT_DIR), env=env,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, **kwargs,
     )
+    _assign_to_job(proc.pid)  # OS-level guarantee the child dies with us
+    return proc
 
 
-async def pipe_output(proc: asyncio.subprocess.Process) -> None:
+async def pipe_output(proc: asyncio.subprocess.Process, label: str = "") -> None:
     assert proc.stdout is not None
+    prefix = f"[{label}] " if label else ""
     while True:
         line = await proc.stdout.readline()
         if not line:
             break
-        print(line.decode("utf-8", "replace").rstrip(), flush=True)
+        print(prefix + line.decode("utf-8", "replace").rstrip(), flush=True)
 
 
-async def status_ticker(bridge: BotBridge, agent: Agent, shutdown: asyncio.Event, interval: float) -> None:
+async def status_ticker(unit: BotUnit, shutdown: asyncio.Event, interval: float) -> None:
     """Print a one-line status update every `interval` seconds (0 = off)."""
     if interval <= 0:
         return
+    bridge, agent = unit.bridge, unit.agent
+    tag = f"[status {unit.label}]" if unit.label else "[status]"
     while not shutdown.is_set():
         try:
             await asyncio.wait_for(shutdown.wait(), timeout=interval)
@@ -167,12 +339,12 @@ async def status_ticker(bridge: BotBridge, agent: Agent, shutdown: asyncio.Event
         except asyncio.TimeoutError:
             pass
         if not bridge.ready:
-            print("[status] offline — bot disconnected / trying to reconnect", flush=True)
+            print(f"{tag} offline — bot disconnected / trying to reconnect", flush=True)
             continue
         try:
             s = await bridge.send("state", timeout=10)
         except BotError:
-            print("[status] (state unavailable)", flush=True)
+            print(f"{tag} (state unavailable)", flush=True)
             continue
         pos = s.get("position") or {}
         ap = s.get("autopilot") or {}
@@ -184,30 +356,34 @@ async def status_ticker(bridge: BotBridge, agent: Agent, shutdown: asyncio.Event
         doing = "fighting" if ap.get("fighting") else ("fleeing" if ap.get("fleeing") else "ok")
         near = f"{players[0]['username']}@{round(players[0]['distance'])}m" if players else "none"
         print(
-            f"[status] {kind}: {goal} | pos ({int(pos.get('x', 0))},{int(pos.get('y', 0))},{int(pos.get('z', 0))}) "
+            f"{tag} {kind}: {goal} | pos ({int(pos.get('x', 0))},{int(pos.get('y', 0))},{int(pos.get('z', 0))}) "
             f"hp {s.get('health')}/20 food {s.get('food')}/20 | held {s.get('heldItem') or '-'} "
             f"| items {sum(inv.values())} | mem {s.get('memMB')}MB | nearest {near} | {doing}",
             flush=True,
         )
 
 
-async def supervise_bot(cfg: argparse.Namespace, bridge: BotBridge, shutdown: asyncio.Event,
-                        holder: dict, max_restarts: int) -> None:
+async def supervise_bot(unit: BotUnit, shutdown: asyncio.Event, max_restarts: int) -> None:
     """Spawn bot.js, connect the bridge, and relaunch it on crash so the session survives.
 
     Only CRASHES relaunch. A deliberate exit — code 0 (clean shutdown) or 1 (gave up
-    reconnecting to MC / bridge port in use) — shuts the controller down instead, since
-    relaunching wouldn't help. On a crash (e.g. OOM abort = 134) the goal/job (kept here
-    in the Python agent) and the server-side position/inventory mean the bot resumes.
+    reconnecting to MC / bridge port in use) — stops this bot instead, since relaunching
+    wouldn't help. On a crash (e.g. OOM abort = 134) the goal/job (kept here in the Python
+    agent) and the server-side position/inventory mean the bot resumes where it left off.
+
+    Only the LAST bot standing triggers a full controller shutdown, so one bot exiting
+    deliberately doesn't take the others down with it.
     """
+    cfg, bridge, holder, label = unit.cfg, unit.bridge, unit.proc_holder, unit.label
+    tag = f"[controller {label}]" if label else "[controller]"
     restarts_left = max_restarts
     while not shutdown.is_set():
         cfg.bridge_port = _find_free_port(cfg.bridge_host, cfg.bridge_port)
         bridge.host, bridge.port = cfg.bridge_host, cfg.bridge_port
-        print(f"[controller] launching bot.js (bridge {cfg.bridge_host}:{cfg.bridge_port}) ...", flush=True)
+        print(f"{tag} launching bot.js (bridge {cfg.bridge_host}:{cfg.bridge_port}) ...", flush=True)
         proc = await spawn_bot(cfg)
         holder["p"] = proc
-        pipe_task = asyncio.create_task(pipe_output(proc))
+        pipe_task = asyncio.create_task(pipe_output(proc, label))
 
         # Connect the bridge to this bot.js, aborting the wait if it dies during startup.
         connect_task = asyncio.create_task(bridge.connect())
@@ -231,19 +407,38 @@ async def supervise_bot(cfg: argparse.Namespace, bridge: BotBridge, shutdown: as
         if shutdown.is_set():
             break
         if rc in (0, 1):  # deliberate exit — not a crash
-            print(f"[controller] bot.js exited (code {rc}) — not a crash; shutting down.", flush=True)
-            shutdown.set()
+            print(f"{tag} bot.js exited (code {rc}) — not a crash; this bot is done.", flush=True)
             break
         if max_restarts > 0 and restarts_left <= 0:
-            print(f"[controller] bot.js crashed (code {rc}) and hit the restart limit — shutting down.", flush=True)
-            shutdown.set()
+            print(f"{tag} bot.js crashed (code {rc}) and hit the restart limit — this bot is done.", flush=True)
             break
         restarts_left -= 1
         left = "unlimited" if max_restarts <= 0 else restarts_left
-        print(f"[controller] bot.js crashed (code {rc}) — relaunching in 3s; it rejoins where it left off "
+        print(f"{tag} bot.js crashed (code {rc}) — relaunching in 3s; it rejoins where it left off "
               f"({left} restarts left).", flush=True)
         await asyncio.sleep(3)
     holder["p"] = None
+
+
+def make_on_event(agent: Agent, label: str):
+    """Per-bot bridge event handler that labels its output so N bots stay legible."""
+    tag = f"[{label}] " if label else ""
+
+    def on_event(event: str, data: dict) -> None:
+        if event == "chat":
+            print(f"{tag}[mc] <{data.get('username')}> {data.get('message')}", flush=True)
+            agent.note_chat(data.get("username", "?"), data.get("message", ""))
+        elif event == "spawn":
+            caps = data.get("capabilities") or {}
+            print(f"{tag}[controller] spawned as {data.get('username')} (v{data.get('version')}) "
+                  f"[pvp={caps.get('pvp')}, collect={caps.get('collect')}]", flush=True)
+        elif event == "auto":
+            extra = {k: v for k, v in data.items() if k != "kind"}
+            print(f"{tag}[auto] {data.get('kind')} {extra or ''}".rstrip(), flush=True)
+        elif event in ("kicked", "end", "error", "death"):
+            print(f"{tag}[mc] {event}: {data}", flush=True)
+
+    return on_event
 
 
 def start_stdin_reader(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue) -> None:
@@ -258,9 +453,18 @@ def start_stdin_reader(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue) ->
     threading.Thread(target=reader, daemon=True, name="stdin-reader").start()
 
 
-async def console(agent: Agent, bridge: BotBridge, llm: OllamaClient,
+async def _broadcast(units: list[BotUnit], action: str, **kw):
+    """Send a bridge action to every ready bot; returns per-bot results/exceptions."""
+    return await asyncio.gather(
+        *[u.bridge.send(action, **kw) for u in units if u.bridge.ready],
+        return_exceptions=True,
+    )
+
+
+async def console(units: list[BotUnit], llm: OllamaClient,
                   shutdown: asyncio.Event, cmd_queue: asyncio.Queue) -> None:
-    print_help()
+    print_help(len(units))
+    agents = [u.agent for u in units]
     while not shutdown.is_set():
         get_task = asyncio.ensure_future(cmd_queue.get())
         stop_task = asyncio.ensure_future(shutdown.wait())
@@ -284,10 +488,11 @@ async def console(agent: Agent, bridge: BotBridge, llm: OllamaClient,
                 shutdown.set()
                 break
             elif v == "help":
-                print_help()
+                print_help(len(units))
             elif v == "goal":
-                agent.set_goal(rest)
-                print(f"[you] goal set: {rest!r}" if rest else "[you] goal cleared")
+                for a in agents:
+                    a.set_goal(rest)
+                print(f"[you] goal set for all: {rest!r}" if rest else "[you] goal cleared")
             elif v == "job":
                 parts = rest.split(None, 1)
                 if not parts:
@@ -297,48 +502,63 @@ async def console(agent: Agent, bridge: BotBridge, llm: OllamaClient,
                     arg = parts[1].strip() if len(parts) > 1 else ""
                     if key in JOB_PRESETS:
                         if key == "defend" and arg:
-                            await bridge.send("setOwner", username=arg, timeout=15)
-                        agent.set_job(JOB_PRESETS[key].replace("{arg}", arg or "the nearest player"))
-                        print(f"[you] job set: {key} {arg}".rstrip())
+                            await _broadcast(units, "setOwner", username=arg, timeout=15)
+                        directive = JOB_PRESETS[key].replace("{arg}", arg or "the nearest player")
+                        for a in agents:
+                            a.set_job(directive)
+                        print(f"[you] job set for all: {key} {arg}".rstrip())
                     else:
-                        agent.set_job(rest)
-                        print(f"[you] job set (custom): {rest!r}")
+                        for a in agents:
+                            a.set_job(rest)
+                        print(f"[you] job set for all (custom): {rest!r}")
             elif v == "reflex":
                 parts = rest.split()
                 keymap = {"eat": "autoEat", "defend": "autoDefend", "pickup": "autoPickup",
                           "wander": "idleWander", "greet": "greet"}
                 if len(parts) >= 2 and parts[0] in ("on", "off"):
                     k = keymap.get(parts[1], parts[1])
-                    await bridge.send("setReflexes", timeout=15, **{k: parts[0] == "on"})
-                    print(f"[you] reflex {k} -> {parts[0]}")
+                    await _broadcast(units, "setReflexes", timeout=15, **{k: parts[0] == "on"})
+                    print(f"[you] reflex {k} -> {parts[0]} (all bots)")
                 else:
-                    ap = (await bridge.send("state", timeout=15)).get("autopilot", {})
-                    print(json.dumps(ap, indent=2))
+                    for u in units:
+                        if not u.bridge.ready:
+                            continue
+                        ap = (await u.bridge.send("state", timeout=15)).get("autopilot", {})
+                        print(f"[{u.label or 'bot'}] " + json.dumps(ap))
             elif v == "owner":
-                await bridge.send("setOwner", username=rest, timeout=15)
-                print(f"[you] owner set: {rest!r}")
+                await _broadcast(units, "setOwner", username=rest, timeout=15)
+                print(f"[you] owner set for all: {rest!r}")
             elif v == "heartbeat":
                 try:
-                    agent.heartbeat = max(0.0, float(rest)) if rest else 0.0
-                    print(f"[you] heartbeat = {agent.heartbeat}s" + (" (off)" if agent.heartbeat <= 0 else ""))
+                    hb = max(0.0, float(rest)) if rest else 0.0
+                    for a in agents:
+                        a.heartbeat = hb
+                    print(f"[you] heartbeat = {hb}s" + (" (off)" if hb <= 0 else ""))
                 except ValueError:
                     print("[error] usage: heartbeat <seconds>  (0 = off)")
             elif v == "narrate":
                 if rest.lower() in ("off", "0", "false", "no"):
-                    agent.narrate = False
+                    val = False
                 elif rest.lower() in ("on", "1", "true", "yes"):
-                    agent.narrate = True
+                    val = True
                 else:
-                    agent.narrate = not agent.narrate
-                print(f"[you] narration {'on' if agent.narrate else 'off'}")
+                    val = not agents[0].narrate
+                for a in agents:
+                    a.narrate = val
+                print(f"[you] narration {'on' if val else 'off'} (all bots)")
             elif v == "say":
-                await bridge.send("chat", message=rest, timeout=15)
+                await _broadcast(units, "chat", message=rest, timeout=15)
             elif v == "stop":
-                agent.set_goal(None)
-                await bridge.send("stop", timeout=15)
-                print("[you] stopped")
+                for a in agents:
+                    a.set_goal(None)
+                await _broadcast(units, "stop", timeout=15)
+                print("[you] stopped (all bots)")
             elif v == "state":
-                print(json.dumps(await bridge.send("state", timeout=15), indent=2))
+                for u in units:
+                    if not u.bridge.ready:
+                        print(f"[{u.label or 'bot'}] (offline)")
+                        continue
+                    print(f"[{u.label or 'bot'}] " + json.dumps(await u.bridge.send("state", timeout=15)))
             elif v in ("model", "models"):
                 models = await llm.list_models()
                 if not models:
@@ -347,7 +567,7 @@ async def console(agent: Agent, bridge: BotBridge, llm: OllamaClient,
                     print(f"[model] {llm.url}  (current: {llm.model})")
                     for i, m in enumerate(models, 1):
                         print(f"   {i:>2}  {m}" + ("   <- current" if m == llm.model else ""))
-                    print("Switch with:  model <number|name>")
+                    print("Switch with:  model <number|name>  (applies to all bots)")
                 else:
                     matches = [m for m in models if m.startswith(rest)]
                     chosen = None
@@ -367,16 +587,18 @@ async def console(agent: Agent, bridge: BotBridge, llm: OllamaClient,
                     else:
                         print(f"[model] no match for {rest!r} — type `model` to list.")
             else:
-                # Anything else is treated as a goal, for convenience.
-                agent.set_goal(line)
-                print(f"[you] goal set: {line!r}")
+                # Anything else is treated as a goal (for all bots), for convenience.
+                for a in agents:
+                    a.set_goal(line)
+                print(f"[you] goal set for all: {line!r}")
         except (BotError, OllamaError) as e:
             print(f"[error] {e}")
 
 
-def print_help() -> None:
+def print_help(n_bots: int = 1) -> None:
+    scope = f"  (commands apply to all {n_bots} bots)" if n_bots > 1 else ""
     print(
-        "\nConsole commands:\n"
+        f"\nConsole commands:{scope}\n"
         "  goal <text>        one-off task (or just type the text)\n"
         "  job <name|text>    standing job that never times out:\n"
         "                       guard | patrol | progress | play | harvest | stash | lumberjack | miner | defend <player> | gather <block>\n"
@@ -389,10 +611,33 @@ def print_help() -> None:
         "  state              print the current world observation\n"
         "  model [n|name]     list the server's models / switch the active one live\n"
         "  help               show this help\n"
-        "  quit               exit\n"
-        "You can also just talk to the bot in-game chat.\n",
+        "  quit               exit (stops every bot)\n"
+        "You can also just talk to the bots in-game chat.\n",
         flush=True,
     )
+
+
+async def terminate_all(units: list[BotUnit]) -> None:
+    """Terminate every bot.js child, escalating to kill if it doesn't exit promptly."""
+    procs = [u.proc_holder.get("p") for u in units]
+    procs = [p for p in procs if p is not None and p.returncode is None]
+    for p in procs:
+        try:
+            p.terminate()
+        except ProcessLookupError:
+            pass
+    if not procs:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*[p.wait() for p in procs], return_exceptions=True), timeout=5)
+    except asyncio.TimeoutError:
+        for p in procs:
+            if p.returncode is None:
+                try:
+                    p.kill()
+                except ProcessLookupError:
+                    pass
 
 
 async def main() -> None:
@@ -423,80 +668,102 @@ async def main() -> None:
     except OllamaError as e:
         print(f"[warn] could not reach Ollama at {cfg.ollama_url}: {e}")
 
-    print(f"[controller] bot name: {cfg.username}  (owner: {cfg.owner or 'none'})", flush=True)
-    bridge = BotBridge(cfg.bridge_host, cfg.bridge_port)
+    _win_job_setup()  # arm the child-cleanup Job Object before spawning anything
     shutdown = asyncio.Event()
-    agent = Agent(bridge, llm, username=cfg.username, tick=cfg.tick,
-                  heartbeat=cfg.heartbeat, narrate=cfg.narrate)
-    proc_holder: dict = {"p": None}
+    loop = asyncio.get_running_loop()
+
+    # Build one BotUnit per bot: distinct name + distinct base bridge port.
+    names = make_bot_names(cfg)
+    units: list[BotUnit] = []
+    for i, name in enumerate(names):
+        ucfg = argparse.Namespace(**vars(cfg))
+        ucfg.username = name
+        # Give each bot its own 20-port band (matching _find_free_port's scan
+        # window) so a busy base port can't bump one bot into another's range.
+        ucfg.bridge_port = cfg.bridge_port + i * 20
+        bridge = BotBridge(ucfg.bridge_host, ucfg.bridge_port)
+        agent = Agent(bridge, llm, username=name, tick=cfg.tick,
+                      heartbeat=cfg.heartbeat, narrate=cfg.narrate)
+        label = name if cfg.bots > 1 else ""
+        bridge.on_event(make_on_event(agent, label))
+        units.append(BotUnit(i, ucfg, bridge, agent, label))
+
+    # Once children exist, Ctrl-C must go through our graceful path (which kills them).
+    install_signal_handlers(loop, shutdown, [u.proc_holder for u in units])
+
+    print(f"[controller] {len(units)} bot(s): {', '.join(u.cfg.username for u in units)}  "
+          f"(owner: {cfg.owner or 'none'})", flush=True)
+
     tasks: list[asyncio.Task] = []
-
-    def on_event(event: str, data: dict) -> None:
-        if event == "chat":
-            print(f"[mc] <{data.get('username')}> {data.get('message')}", flush=True)
-            agent.note_chat(data.get("username", "?"), data.get("message", ""))
-        elif event == "spawn":
-            caps = data.get("capabilities") or {}
-            print(f"[controller] bot spawned as {data.get('username')} (v{data.get('version')}) "
-                  f"[pvp={caps.get('pvp')}, collect={caps.get('collect')}]", flush=True)
-        elif event == "auto":
-            extra = {k: v for k, v in data.items() if k != "kind"}
-            print(f"[auto] {data.get('kind')} {extra or ''}".rstrip(), flush=True)
-        elif event in ("kicked", "end", "error", "death"):
-            print(f"[mc] {event}: {data}", flush=True)
-
-    bridge.on_event(on_event)
-
+    supervisor_tasks: list[asyncio.Task] = []
     try:
-        # Bring up the Node bot. The supervisor spawns it, connects the bridge, and
-        # relaunches on crash so the session survives — the goal/job lives here in Python
-        # and the MC server restores position/inventory, so the bot resumes where it left off.
         if cfg.external_bot:
-            print(f"[controller] connecting to external bot bridge {cfg.bridge_host}:{cfg.bridge_port} ...", flush=True)
-            await bridge.connect()
+            print(f"[controller] connecting to external bot bridge "
+                  f"{units[0].cfg.bridge_host}:{units[0].cfg.bridge_port} ...", flush=True)
+            await units[0].bridge.connect()
         else:
             await ensure_bot_deps(cfg)
-            tasks.append(asyncio.create_task(
-                supervise_bot(cfg, bridge, shutdown, proc_holder, cfg.max_bot_restarts)))
+            for u in units:
+                t = asyncio.create_task(supervise_bot(u, shutdown, cfg.max_bot_restarts))
+                supervisor_tasks.append(t)
+                tasks.append(t)
 
-        # Wait (briefly) for the first spawn so the first goal doesn't fire into a void.
-        print("[controller] waiting for the bot to spawn (is your world/server running?) ...", flush=True)
+        # Wait (briefly) for spawns so the first goal doesn't fire into a void.
+        print("[controller] waiting for bots to spawn (is your world/server running?) ...", flush=True)
         for _ in range(120):
-            if bridge.ready or shutdown.is_set():
+            if shutdown.is_set() or all(u.bridge.ready for u in units):
                 break
             await asyncio.sleep(0.5)
-        if not bridge.ready and not shutdown.is_set():
-            print("[controller] not spawned yet — it'll keep trying. Open your world to LAN "
+        up = sum(1 for u in units if u.bridge.ready)
+        if up < len(units) and not shutdown.is_set():
+            print(f"[controller] {up}/{len(units)} up — the rest keep trying. Open your world to LAN "
                   "(set --mc-port to the port it prints), or start a server.", flush=True)
 
-        if cfg.goal:
-            agent.set_goal(cfg.goal)
-
         cmd_queue: asyncio.Queue = asyncio.Queue()
-        start_stdin_reader(asyncio.get_running_loop(), cmd_queue)
-        tasks.append(asyncio.create_task(agent.run()))
-        tasks.append(asyncio.create_task(console(agent, bridge, llm, shutdown, cmd_queue)))
-        tasks.append(asyncio.create_task(status_ticker(bridge, agent, shutdown, cfg.status_interval)))
+        start_stdin_reader(loop, cmd_queue)
+        for u in units:
+            if cfg.goal:
+                u.agent.set_goal(cfg.goal)
+            tasks.append(asyncio.create_task(u.agent.run()))
+            tasks.append(asyncio.create_task(status_ticker(u, shutdown, cfg.status_interval)))
+        tasks.append(asyncio.create_task(console(units, llm, shutdown, cmd_queue)))
 
-        await shutdown.wait()
+        # Run until the user quits (shutdown) or every bot's supervisor has exited
+        # on its own (all bots done/crashed out) — then there's nothing left to drive.
+        await _wait_until_done(shutdown, supervisor_tasks)
     finally:
-        print("[controller] shutting down ...", flush=True)
-        agent.stop()
+        print("[controller] shutting down — stopping all bots ...", flush=True)
+        for u in units:
+            u.agent.stop()
         for t in tasks:
             t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        await bridge.close()
-        p = proc_holder.get("p")
-        if p and p.returncode is None:
+        for u in units:
             try:
-                p.terminate()
-                await asyncio.wait_for(p.wait(), timeout=5)
-            except (ProcessLookupError, asyncio.TimeoutError):
-                try:
-                    p.kill()
-                except ProcessLookupError:
-                    pass
+                await u.bridge.close()
+            except Exception:
+                pass
+        await terminate_all(units)
+        # Closing the Job Object handle at interpreter exit reaps any stragglers.
+
+
+async def _wait_until_done(shutdown: asyncio.Event, supervisor_tasks: list[asyncio.Task]) -> None:
+    """Return when the user asks to quit, or when every bot supervisor has finished
+    (all bots exited deliberately / gave up). Watches task completion, not the proc
+    holders, so it can't misfire during the pre-spawn startup window."""
+    if not supervisor_tasks:  # e.g. --external-bot
+        await shutdown.wait()
+        return
+    while not shutdown.is_set():
+        if all(t.done() for t in supervisor_tasks):
+            print("[controller] all bots have exited — shutting down.", flush=True)
+            shutdown.set()
+            return
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
 
 
 if __name__ == "__main__":
