@@ -30,6 +30,8 @@ BOT_DIR = Path(__file__).resolve().parent / "bot"
 JOB_PRESETS = {
     "guard": "Guard this spot. Stay within ~8 blocks of where you are now and attack any hostile mobs that approach. Do not wander far.",
     "patrol": "Patrol the nearby area: keep walking around and attack any hostile mobs you see.",
+    "progress": "Gear up: use gearUp to craft the next tool you need; when it says you need wood or stone, harvestNearest to get it, then gearUp again. Keep upgrading until you have stone tools.",
+    "play": "Play like a real Minecraft player: keep your gear upgraded (gearUp + harvestNearest), then VARY what you do — gather, explore new spots, build, hunt, stash loot in a chest. Don't stand still or repeat one thing.",
     "harvest": "Gather resources continuously: use harvestNearest to mine and collect the nearest useful block. When your inventory is getting full, use stashResources to deposit everything into a chest, then keep gathering.",
     "stash": "Deposit your loot: use stashResources to walk to the nearest chest and store all your gathered resources.",
     "lumberjack": "Chop wood continuously: mine the nearest log (oak_log, birch_log, etc.) and collect the drops. When your inventory fills up, use stashResources to store the wood, then keep going.",
@@ -377,7 +379,7 @@ def print_help() -> None:
         "\nConsole commands:\n"
         "  goal <text>        one-off task (or just type the text)\n"
         "  job <name|text>    standing job that never times out:\n"
-        "                       guard | patrol | harvest | stash | lumberjack | miner | defend <player> | gather <block>\n"
+        "                       guard | patrol | progress | play | harvest | stash | lumberjack | miner | defend <player> | gather <block>\n"
         "  reflex on|off <x>  toggle a reflex: eat|defend|pickup|wander|greet  (no arg = show autopilot)\n"
         "  owner <player>     set who the bot protects / flees toward\n"
         "  heartbeat <secs>   auto-resume the last goal/job after N idle seconds (0 = off)\n"

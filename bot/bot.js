@@ -283,6 +283,98 @@ function isKeepItem (name) {
   if (mcData.foodsByName && mcData.foodsByName[name]) return true
   return /pickaxe|axe|shovel|sword|hoe|bow|crossbow|shield|helmet|chestplate|leggings|boots|elytra|totem|torch|bucket|flint_and_steel|shears|ender_pearl|_bed$/.test(name)
 }
+
+// ---------------------------------------------------------------------------
+// Crafting / gear helpers (all fail soft — never throw out of gearUp/craft).
+// ---------------------------------------------------------------------------
+const TOOL_SPECS = {
+  wooden_pickaxe: { base: 'planks', baseCount: 3, sticks: 2 },
+  wooden_sword: { base: 'planks', baseCount: 2, sticks: 1 },
+  wooden_axe: { base: 'planks', baseCount: 3, sticks: 2 },
+  stone_pickaxe: { base: 'cobblestone', baseCount: 3, sticks: 2 },
+  stone_sword: { base: 'cobblestone', baseCount: 1, sticks: 1 },
+  stone_axe: { base: 'cobblestone', baseCount: 3, sticks: 2 },
+}
+const TOOL_KINDS = ['netherite', 'diamond', 'iron', 'stone', 'golden', 'wooden']
+
+function invCount (name) { return bot.inventory.items().filter((i) => i.name === name).reduce((a, i) => a + i.count, 0) }
+function invCountRe (re) { return bot.inventory.items().filter((i) => re.test(i.name)).reduce((a, i) => a + i.count, 0) }
+function firstItem (re) { return bot.inventory.items().find((i) => re.test(i.name)) }
+function logToPlanks (logName) {
+  const plank = logName.replace(/_log$|_wood$|_stem$|_hyphae$/, '') + '_planks'
+  return mcData.itemsByName[plank] ? plank : 'oak_planks'
+}
+function nearbyTable () {
+  const def = mcData.blocksByName.crafting_table
+  return def ? bot.findBlock({ matching: def.id, maxDistance: 4 }) : null
+}
+async function craftOne (itemName, table) {
+  const def = mcData.itemsByName[itemName]
+  if (!def) return false
+  const recipes = bot.recipesFor(def.id, null, 1, table || null)
+  if (!recipes.length) return false
+  try { await bot.craft(recipes[0], 1, table || undefined); return true } catch (e) { return false }
+}
+async function ensurePlanks (need) {
+  let guard = 0
+  while (invCountRe(/_planks$/) < need && guard++ < 20) {
+    const log = firstItem(/_log$|_wood$|_stem$|_hyphae$/)
+    if (!log || !await craftOne(logToPlanks(log.name), null)) return false
+  }
+  return invCountRe(/_planks$/) >= need
+}
+async function ensureSticks (need) {
+  let guard = 0
+  while (invCount('stick') < need && guard++ < 20) {
+    if (!await ensurePlanks(2) || !await craftOne('stick', null)) return false
+  }
+  return invCount('stick') >= need
+}
+async function ensureTable () {
+  let table = nearbyTable()
+  if (table) return table
+  let item = bot.inventory.items().find((i) => i.name === 'crafting_table')
+  if (!item) {
+    if (!await ensurePlanks(4) || !await craftOne('crafting_table', null)) return null
+    item = bot.inventory.items().find((i) => i.name === 'crafting_table')
+    if (!item) return null
+  }
+  try {
+    await bot.equip(item, 'hand')
+    const base = bot.entity.position.floored()
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const ref = bot.blockAt(base.offset(dx, -1, dz))
+      const cell = bot.blockAt(base.offset(dx, 0, dz))
+      if (ref && ref.boundingBox === 'block' && cell && cell.name === 'air') {
+        try { await bot.lookAt(cell.position.offset(0.5, 0.5, 0.5)); await bot.placeBlock(ref, new Vec3(0, 1, 0)); break } catch (e) {}
+      }
+    }
+  } catch (e) {}
+  return nearbyTable()
+}
+function toolTier (kind) {
+  for (const t of TOOL_KINDS) if (bot.inventory.items().find((i) => i.name === `${t}_${kind}`)) return t
+  return null
+}
+function gearSummary () {
+  return {
+    pickaxe: toolTier('pickaxe'), sword: toolTier('sword'), axe: toolTier('axe'), shovel: toolTier('shovel'),
+    logs: invCountRe(/_log$/), planks: invCountRe(/_planks$/), sticks: invCount('stick'), cobblestone: invCount('cobblestone'),
+  }
+}
+async function makeTool (name) {
+  const spec = TOOL_SPECS[name]
+  if (!spec) return { ok: false, reason: `don't know how to make ${name}` }
+  if (spec.base === 'planks') {
+    if (!await ensurePlanks(spec.baseCount)) return { ok: false, need: 'oak_log', reason: 'need wood — harvest logs' }
+  } else if (invCount('cobblestone') < spec.baseCount) {
+    return { ok: false, need: 'stone', reason: 'need cobblestone — mine stone (harvestNearest)' }
+  }
+  if (!await ensureSticks(spec.sticks)) return { ok: false, need: 'oak_log', reason: 'need wood for sticks' }
+  const table = await ensureTable()
+  if (!table) return { ok: false, need: 'oak_log', reason: 'need a crafting table (and wood to make it)' }
+  return await craftOne(name, table) ? { ok: true, crafted: name } : { ok: false, reason: `could not craft ${name}` }
+}
 async function equipBestTool (block) {
   const n = block.name
   let kind = null
@@ -466,6 +558,7 @@ function buildState () {
     isDay: bot.time ? (bot.time.timeOfDay % 24000 < 12300) : null,
     isRaining: bot.isRaining,
     heldItem: bot.heldItem ? bot.heldItem.name : null,
+    gear: gearSummary(),
     inventory, lookingAt,
     players: players.slice(0, 8),
     entities: entities.slice(0, 10),
@@ -711,22 +804,32 @@ const ACTIONS = {
   },
 
   craft: async (args) => {
-    requireBot()
+    requireBot(); stopCombat()
     const name = args.name
+    if (TOOL_SPECS[name]) return await makeTool(name) // tools auto-make planks/sticks/table
     const itemDef = mcData.itemsByName[name]
     if (!itemDef) throw new Error(`unknown item: ${name}`)
     const count = clamp(args.count || 1, 1, 64)
-    let table = bot.findBlock({ matching: mcData.blocksByName.crafting_table && mcData.blocksByName.crafting_table.id, maxDistance: 4 })
-    let recipes = bot.recipesFor(itemDef.id, null, 1, table)
-    if (!recipes.length) {
-      const t2 = bot.findBlock({ matching: mcData.blocksByName.crafting_table && mcData.blocksByName.crafting_table.id, maxDistance: 16 })
-      if (t2 && t2 !== table) {
-        try { await bot.pathfinder.goto(new GoalGetToBlock(t2.position.x, t2.position.y, t2.position.z)) } catch (e) {}
-        table = t2; recipes = bot.recipesFor(itemDef.id, null, 1, table)
-      }
-    }
-    if (!recipes.length) return { crafted: false, reason: table ? 'missing ingredients' : 'need a crafting table nearby (or ingredients)' }
+    const table = nearbyTable() || await ensureTable()
+    const recipes = bot.recipesFor(itemDef.id, null, 1, table)
+    if (!recipes.length) return { crafted: false, reason: `missing ingredients for ${name}` }
     try { await bot.craft(recipes[0], count, table || undefined); return { crafted: true, item: name, count } } catch (e) { return { crafted: false, error: e.message } }
+  },
+
+  // Self-analyze gear and craft the next tool in the progression (wooden pickaxe
+  // -> stone pickaxe -> stone sword -> stone axe). Reports what raw material to
+  // gather if short, so the caller can harvestNearest and call gearUp again.
+  gearUp: async () => {
+    requireBot(); stopCombat()
+    const g = gearSummary()
+    let target = null
+    if (!g.pickaxe) target = 'wooden_pickaxe'
+    else if (g.pickaxe === 'wooden') target = 'stone_pickaxe'
+    else if (!g.sword) target = 'stone_sword'
+    else if (!g.axe) target = 'stone_axe'
+    if (!target) return { done: true, message: 'fully geared (stone tools)', gear: g }
+    const res = await makeTool(target)
+    return { target, ...res, gear: gearSummary() }
   },
 
   depositChest: async (args) => {
