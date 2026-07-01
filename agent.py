@@ -171,7 +171,7 @@ class Agent:
     _TIMEOUTS = {"goto": 120, "gotoPlayer": 120, "follow": 15, "mine": 180, "place": 60,
                  "collect": 90, "lookAt": 15, "sleep": 60, "craft": 60,
                  "depositChest": 60, "withdrawChest": 60, "flee": 15,
-                 "harvestNearest": 180, "stashResources": 120, "gearUp": 90}
+                 "harvestNearest": 180, "stashResources": 120, "gearUp": 220}
 
     def _command_for(self, d: dict) -> Optional[tuple[str, dict]]:
         action = d.get("action", "none")

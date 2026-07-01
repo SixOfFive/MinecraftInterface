@@ -574,7 +574,7 @@ async function gatherMaterial (need, count) {
   const spec = GATHER_SPECS[need]
   if (!spec) return 0
   const want = clamp(count || spec.batch, 1, 16)
-  const deadline = Date.now() + 90000 // room to walk out and find/collect
+  const deadline = Date.now() + 70000 // room to walk out and find/collect (under the gearUp action timeout)
   const isWood = need === 'oak_log'
   let got = 0
   let stuckKey = null
