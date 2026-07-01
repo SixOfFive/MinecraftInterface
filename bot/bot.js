@@ -44,7 +44,9 @@ const CONFIG = {
   // Headless bots don't need to see far; a small view distance keeps chunk memory
   // low and prevents the Node heap from ballooning (OOM). tiny|short|normal|far.
   viewDistance: process.env.MC_VIEW_DISTANCE || 'tiny',
-  canDig: envBool('MOVE_CAN_DIG', true),
+  // canDig true makes the pathfinder treat every block as diggable, exploding the A*
+  // search (millions of nodes -> GBs -> heap OOM) when a target is buried. Off by default.
+  canDig: envBool('MOVE_CAN_DIG', false),
   autoReconnect: envBool('MC_AUTO_RECONNECT', true),
   reconnectDelayMs: parseInt(process.env.MC_RECONNECT_MS || '5000', 10),
   maxReconnect: parseInt(process.env.MC_MAX_RECONNECT || '5', 10), // 0 = retry forever
@@ -192,9 +194,12 @@ function createBot () {
       .filter((v) => v !== undefined && v !== null)
     const move = new Movements(bot)
     move.canDig = CONFIG.canDig
+    move.allow1by1towers = false // pillaring also balloons the pathfinder search/memory
     move.allowSprinting = true
     move.allowParkour = true
     bot.pathfinder.setMovements(move)
+    // Cap A* time so a single hard/unreachable search can't allocate unbounded memory.
+    bot.pathfinder.thinkTimeout = parseInt(process.env.PATHFINDER_TIMEOUT_MS || '4000', 10)
     log(`spawned as ${bot.username} (v${bot.version}) at`, prettyVec(bot.entity.position))
     emit('spawn', {
       username: bot.username, version: bot.version, position: vec(bot.entity.position),
@@ -456,6 +461,7 @@ function buildState () {
     gameMode: bot.game && bot.game.gameMode, dimension: bot.game && bot.game.dimension,
     position: vec(pos), yaw: round(rad2deg(e.yaw)), pitch: round(rad2deg(e.pitch)),
     health: bot.health, food: bot.food, oxygen: bot.oxygenLevel, onGround: e.onGround,
+    memMB: Math.round(process.memoryUsage().heapUsed / 1048576),
     timeOfDay: bot.time && bot.time.timeOfDay,
     isDay: bot.time ? (bot.time.timeOfDay % 24000 < 12300) : null,
     isRaining: bot.isRaining,

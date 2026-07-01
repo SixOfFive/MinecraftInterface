@@ -179,7 +179,7 @@ async def status_ticker(bridge: BotBridge, agent: Agent, shutdown: asyncio.Event
         print(
             f"[status] {kind}: {goal} | pos ({int(pos.get('x', 0))},{int(pos.get('y', 0))},{int(pos.get('z', 0))}) "
             f"hp {s.get('health')}/20 food {s.get('food')}/20 | held {s.get('heldItem') or '-'} "
-            f"| items {sum(inv.values())} | nearest {near} | {doing}",
+            f"| items {sum(inv.values())} | mem {s.get('memMB')}MB | nearest {near} | {doing}",
             flush=True,
         )
 

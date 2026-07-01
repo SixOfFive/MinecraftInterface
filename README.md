@@ -182,8 +182,9 @@ last‑resort fallback constant, `DEFAULT_MODEL` in `ollama_client.py`.)
 | `--list-models` | — | — | Print local Ollama models and exit |
 
 Node‑side extras (env only): `MC_VIEW_DISTANCE` (`tiny`/`short`/`normal`/`far` — default
-`tiny` to keep chunk memory low and avoid heap OOM), `MOVE_CAN_DIG` (`true`/`false` — let
-the bot tunnel to reach goals), `MC_AUTO_RECONNECT`, `MC_RECONNECT_MS`, `MC_MAX_RECONNECT`
+`tiny` to keep chunk memory low), `MOVE_CAN_DIG` (default `false`; `true` lets the bot tunnel
+to buried resources but can blow up pathfinder memory), `PATHFINDER_TIMEOUT_MS` (A* time cap,
+default 4000), `MC_AUTO_RECONNECT`, `MC_RECONNECT_MS`, `MC_MAX_RECONNECT`
 (give up + exit after N failed reconnects so the controller can terminate; `0` = retry forever),
 and the reflex knobs
 (`AUTO_EAT`, `AUTO_DEFEND`, `AUTO_PICKUP`, `IDLE_WANDER`, `GREET`, `EAT_AT`,
@@ -231,10 +232,11 @@ its output is always a valid action object — no markdown fences or stray prose
 - **`player not visible`** — the target player is out of the bot's tracking range;
   the bot only knows about entities the server has sent it. If it happens a lot, raise
   `MC_VIEW_DISTANCE` (at the cost of more memory).
-- **Bot crashes with `JavaScript heap out of memory` (exit 134)** — Mineflayer holds the
-  world's chunks in memory; a large view distance (especially with several wandering bots)
-  can blow the ~4 GB Node heap. Keep `MC_VIEW_DISTANCE=tiny` (the default), and consider
-  `reflex off wander` so idle bots don't keep loading fresh chunks.
+- **Bot crashes with `JavaScript heap out of memory` (exit 134)** — usually the pathfinder:
+  with `MOVE_CAN_DIG=true`, searching a path to a buried block (e.g. `mine stone`) explodes the
+  A* search into GBs. Keep `MOVE_CAN_DIG=false` (the default) so it paths over terrain, and
+  `MC_VIEW_DISTANCE=tiny`. Watch the `mem NNNMB` field in the status line — it should stay
+  low/flat, not climb toward 4000. (`reflex off wander` also helps idle bots stop loading chunks.)
 
 ---
 
