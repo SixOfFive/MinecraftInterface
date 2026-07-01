@@ -537,36 +537,71 @@ const GATHER_SPECS = {
   raw_iron: { match: (b) => /iron_ore$/.test(b.name), batch: 8, label: 'iron ore' },
   coal: { match: (b) => /coal_ore$/.test(b.name), batch: 4, label: 'coal ore' },
 }
+// Walk over nearby item drops so they actually enter the inventory (digging a
+// block does not auto-collect the drop). Shared by gatherMaterial + harvestNearest.
+async function collectDropsNearby (radius) {
+  try {
+    for (let i = 0; i < 12; i++) {
+      const item = bot.nearestEntity((en) => en.name === 'item' && en.position && bot.entity.position.distanceTo(en.position) <= radius)
+      if (!item) break
+      const p = item.position
+      await bot.pathfinder.goto(new GoalNear(p.x, p.y, p.z, 1)); await sleep(150)
+    }
+  } catch (e) {}
+}
+// Walk ~20 blocks in a random direction to load fresh terrain, so a bot with a
+// tiny view distance can still discover resources it couldn't originally see.
+async function exploreStep () {
+  try {
+    const p = bot.entity.position
+    const ang = Math.random() * Math.PI * 2
+    await bot.pathfinder.goto(new GoalNear(Math.floor(p.x + Math.cos(ang) * 20), Math.floor(p.y), Math.floor(p.z + Math.sin(ang) * 20), 3))
+  } catch (e) {}
+}
+// Fell a tree: greedily mine logs connected to a trunk (incl. straight up, as
+// lower logs are removed the higher ones come within reach). Bounded.
+async function fellConnectedLogs (startPos, remaining, deadline) {
+  let felled = 0
+  for (let n = 0; n < remaining + 8 && Date.now() < deadline && felled < remaining; n++) {
+    const log = bot.findBlock({ matching: (b) => b && /_log$/.test(b.name), maxDistance: 5, point: startPos })
+    if (!log) break
+    try {
+      await bot.pathfinder.goto(new GoalGetToBlock(log.position.x, log.position.y, log.position.z))
+      await equipBestTool(log)
+      if (bot.canDigBlock(log)) { await bot.dig(log); felled++ } else break
+    } catch (e) { break }
+  }
+  return felled
+}
 async function gatherMaterial (need, count) {
   const spec = GATHER_SPECS[need]
   if (!spec) return 0
   const want = clamp(count || spec.batch, 1, 16)
-  const deadline = Date.now() + 60000
+  const deadline = Date.now() + 90000 // room to walk out and find/collect
+  const isWood = need === 'oak_log'
   let got = 0
   let stuckKey = null
-  for (let i = 0; i < want; i++) {
-    if (Date.now() > deadline) break
-    const block = bot.findBlock({ matching: (b) => b && spec.match(b), maxDistance: 48 })
-    if (!block) break
-    const key = `${block.position.x},${block.position.y},${block.position.z}`
-    if (key === stuckKey) break // couldn't make progress on the nearest one
+  let misses = 0
+  while (got < want && Date.now() < deadline) {
+    const block = bot.findBlock({ matching: (b) => b && spec.match(b), maxDistance: 64 })
+    const key = block ? `${block.position.x},${block.position.y},${block.position.z}` : null
+    if (!block || key === stuckKey) {
+      if (misses++ >= 4) break // give up after a few fruitless explore hops
+      await exploreStep()
+      stuckKey = null
+      continue
+    }
     try {
       await bot.pathfinder.goto(new GoalGetToBlock(block.position.x, block.position.y, block.position.z))
       await equipBestTool(block)
       if (bot.canDigBlock(block)) await bot.dig(block)
       got++
       stuckKey = null
+      misses = 0
+      if (isWood) got += await fellConnectedLogs(block.position, want - got, deadline)
     } catch (e) { stuckKey = key }
   }
-  // walk over the drops so they're picked up
-  try {
-    for (let i = 0; i < 10; i++) {
-      const item = bot.nearestEntity((en) => en.name === 'item' && en.position && bot.entity.position.distanceTo(en.position) <= 12)
-      if (!item) break
-      const p = item.position
-      await bot.pathfinder.goto(new GoalNear(p.x, p.y, p.z, 1)); await sleep(150)
-    }
-  } catch (e) {}
+  await collectDropsNearby(14)
   try { bot.pathfinder.setGoal(null) } catch (e) {}
   return got
 }
@@ -927,6 +962,7 @@ const ACTIONS = {
         stuckKey = null
       } catch (e) { stuckKey = key }
     }
+    await collectDropsNearby(14) // digging doesn't auto-collect — walk over the drops
     try { bot.pathfinder.setGoal(null) } catch (e) {}
     return { total, harvested }
   },
