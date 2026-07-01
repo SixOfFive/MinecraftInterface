@@ -526,18 +526,49 @@ async function makeArmor (name) {
   if (item) { try { await bot.equip(item, spec.slot) } catch (e) {} }
   return { ok: true, crafted: name, equipped: !!item }
 }
-// When gearUp can't act, tell the caller what raw material to gather next.
-function nextGearNeed (g) {
-  const armorLeft = ['torso', 'legs', 'head', 'feet'].filter((k) => !g.armor[k])
-  const toolsLeft = g.pickaxe === 'stone' || g.sword === 'stone'
-  if (!toolsLeft && armorLeft.length === 0) return { done: true, message: 'fully geared (iron tools + armor)', gear: g }
-  if (g.rawIron > 0 && !g.furnace && g.cobblestone < 8) return { done: false, need: 'cobblestone', message: 'have raw iron — mine 8 cobblestone to build a furnace', gear: g }
-  if (g.rawIron > 0 && !findFuelItem()) return { done: false, need: 'coal', message: 'have raw iron — need fuel (coal or wood) to smelt', gear: g }
-  if (g.iron === 0 && g.rawIron === 0) {
-    if (!g.furnace && g.cobblestone < 8) return { done: false, need: 'cobblestone', message: 'to reach iron gear: mine cobblestone (furnace) then iron_ore', gear: g }
-    return { done: false, need: 'raw_iron', message: 'mine iron_ore to smelt into iron gear', gear: g }
+// Code-driven gather: walk to and mine the exact material gearUp needs, then
+// collect the drops. This makes the ladder self-completing — gearUp no longer
+// depends on the LLM choosing the right harvest. Returns how many were mined.
+const STONE_RE = /^(stone|cobblestone)$/ // both yield cobblestone (stone-tool material)
+const GATHER_SPECS = {
+  oak_log: { match: (b) => /_log$/.test(b.name), batch: 4, label: 'wood' },
+  stone: { match: (b) => STONE_RE.test(b.name), batch: 10, label: 'stone' },
+  cobblestone: { match: (b) => STONE_RE.test(b.name), batch: 10, label: 'stone' },
+  raw_iron: { match: (b) => /iron_ore$/.test(b.name), batch: 8, label: 'iron ore' },
+  coal: { match: (b) => /coal_ore$/.test(b.name), batch: 4, label: 'coal ore' },
+}
+async function gatherMaterial (need, count) {
+  const spec = GATHER_SPECS[need]
+  if (!spec) return 0
+  const want = clamp(count || spec.batch, 1, 16)
+  const deadline = Date.now() + 60000
+  let got = 0
+  let stuckKey = null
+  for (let i = 0; i < want; i++) {
+    if (Date.now() > deadline) break
+    const block = bot.findBlock({ matching: (b) => b && spec.match(b), maxDistance: 48 })
+    if (!block) break
+    const key = `${block.position.x},${block.position.y},${block.position.z}`
+    if (key === stuckKey) break // couldn't make progress on the nearest one
+    try {
+      await bot.pathfinder.goto(new GoalGetToBlock(block.position.x, block.position.y, block.position.z))
+      await equipBestTool(block)
+      if (bot.canDigBlock(block)) await bot.dig(block)
+      got++
+      stuckKey = null
+    } catch (e) { stuckKey = key }
   }
-  return { done: false, need: 'raw_iron', message: 'gather more iron_ore to finish gear', gear: g }
+  // walk over the drops so they're picked up
+  try {
+    for (let i = 0; i < 10; i++) {
+      const item = bot.nearestEntity((en) => en.name === 'item' && en.position && bot.entity.position.distanceTo(en.position) <= 12)
+      if (!item) break
+      const p = item.position
+      await bot.pathfinder.goto(new GoalNear(p.x, p.y, p.z, 1)); await sleep(150)
+    }
+  } catch (e) {}
+  try { bot.pathfinder.setGoal(null) } catch (e) {}
+  return got
 }
 
 async function equipBestTool (block) {
@@ -547,7 +578,11 @@ async function equipBestTool (block) {
   else if (/log|planks|wood|fence|crafting_table|bookshelf/.test(n)) kind = 'axe'
   else if (/dirt|grass|sand|gravel|clay|soul|snow|mud/.test(n)) kind = 'shovel'
   if (!kind) return
-  const tool = bot.inventory.items().find((i) => i.name.includes(kind))
+  // Best tier first (TOOL_KINDS is netherite..wooden) — using a wooden pickaxe on
+  // iron ore breaks it but drops nothing, so the tier actually matters here.
+  let tool = null
+  for (const t of TOOL_KINDS) { const it = bot.inventory.items().find((i) => i.name === `${t}_${kind}`); if (it) { tool = it; break } }
+  if (!tool) tool = bot.inventory.items().find((i) => i.name.includes(kind))
   if (tool) { try { await bot.equip(tool, 'hand') } catch (e) {} }
 }
 async function manualAttack (target, maxMs) {
@@ -981,54 +1016,69 @@ const ACTIONS = {
     try { await bot.craft(recipes[0], count, table || undefined); return { crafted: true, item: name, count } } catch (e) { return { crafted: false, error: e.message } }
   },
 
-  // Self-analyze gear and take ONE step up the ladder per call:
+  // Self-analyze gear and take ONE step up the ladder per call, GATHERING the
+  // material it needs itself (walk + mine) rather than relying on the LLM:
   // wooden pickaxe -> stone tools -> furnace -> smelt iron -> iron pickaxe/sword
-  // -> iron armor. Reports what raw material to gather if short, so the caller
-  // can harvestNearest (wood/stone/iron_ore/coal) and call gearUp again.
+  // -> iron armor. Only reports a need when the material isn't within reach
+  // (e.g. no iron ore nearby) so the caller can relocate.
   gearUp: async () => {
     requireBot(); stopCombat()
     const g = gearSummary()
 
-    // 1) wood + stone tool ladder
+    // Run a craft step; if it reports a gatherable need, code-mine that material
+    // and retry the step once. Keeps each gearUp call self-completing.
+    const withGather = async (fn) => {
+      let res = await fn()
+      const need = res && res.need
+      if (need && GATHER_SPECS[need]) {
+        const got = await gatherMaterial(need)
+        res = got > 0 ? await fn() : res
+        res.gathered = { [need]: got }
+      }
+      return res
+    }
+
+    // 1) wood + stone tool ladder (self-gathers wood, then stone)
     let target = null
     if (!g.pickaxe) target = 'wooden_pickaxe'
     else if (g.pickaxe === 'wooden') target = 'stone_pickaxe'
     else if (!g.sword) target = 'stone_sword'
     else if (!g.axe) target = 'stone_axe'
-    if (target) { const res = await makeTool(target); return { stage: 'stone-tools', target, ...res, gear: gearSummary() } }
+    if (target) { const res = await withGather(() => makeTool(target)); return { stage: 'stone-tools', target, ...res, gear: gearSummary() } }
 
-    // 2) build a furnace once we have cobblestone (and don't already have one)
-    if (!g.furnace && g.cobblestone >= 8) {
-      const f = await ensureFurnace()
-      if (f) return { stage: 'furnace', target: 'furnace', ok: true, gear: gearSummary() }
-      // ensureFurnace crafts before placing, so a furnace item now on hand means
-      // the craft worked but there was nowhere to place it — don't ask for cobble.
-      return invCount('furnace') > 0
-        ? { stage: 'furnace', target: 'furnace', ok: false, need: 'space', reason: 'crafted a furnace but no room to place it — move to open ground', gear: gearSummary() }
-        : { stage: 'furnace', target: 'furnace', ok: false, need: 'cobblestone', reason: 'could not build a furnace', gear: gearSummary() }
+    // 2) build a furnace (self-gathers cobblestone if short)
+    if (!g.furnace) {
+      const res = await withGather(async () => {
+        if (invCount('cobblestone') < 8) return { ok: false, need: 'cobblestone', reason: 'need 8 cobblestone for a furnace' }
+        const f = await ensureFurnace()
+        if (f) return { ok: true }
+        return invCount('furnace') > 0
+          ? { ok: false, need: 'space', reason: 'crafted a furnace but no room to place it — move to open ground' }
+          : { ok: false, need: 'cobblestone', reason: 'could not build a furnace' }
+      })
+      return { stage: 'furnace', target: 'furnace', ...res, gear: gearSummary() }
     }
 
-    // 3) smelt raw iron into ingots
-    if (g.rawIron > 0 && (g.furnace || g.cobblestone >= 8)) {
-      const res = await smeltIron(8)
+    // Past stone tier: figure out what iron gear is still missing.
+    const needIronTools = g.pickaxe === 'stone' || g.sword === 'stone'
+    const armorNext = ARMOR_PRIORITY.find((n) => !g.armor[ARMOR_SPECS[n].key])
+    if (!needIronTools && !armorNext) return { done: true, message: 'fully geared (iron tools + armor)', gear: g }
+
+    // 3) smelt raw iron we already have (self-gathers fuel if short)
+    if (g.rawIron > 0) {
+      const res = await withGather(() => smeltIron(8))
       return { stage: 'smelt', ...res, gear: gearSummary() }
     }
 
-    // 4) upgrade pickaxe/sword to iron
+    // 4) enough ingots on hand -> craft the next iron item
     if (g.pickaxe === 'stone' && g.iron >= 3) { const res = await makeTool('iron_pickaxe'); return { stage: 'iron-tools', target: 'iron_pickaxe', ...res, gear: gearSummary() } }
     if (g.sword === 'stone' && g.iron >= 2) { const res = await makeTool('iron_sword'); return { stage: 'iron-tools', target: 'iron_sword', ...res, gear: gearSummary() } }
+    if (armorNext && g.iron >= ARMOR_SPECS[armorNext].iron) { const res = await makeArmor(armorNext); return { stage: 'armor', target: armorNext, ...res, gear: gearSummary() } }
 
-    // 5) craft the best armor piece we can afford and don't already have
-    for (const name of ARMOR_PRIORITY) {
-      const spec = ARMOR_SPECS[name]
-      if (!g.armor[spec.key] && g.iron >= spec.iron) {
-        const res = await makeArmor(name)
-        return { stage: 'armor', target: name, ...res, gear: gearSummary() }
-      }
-    }
-
-    // 6) nothing craftable right now — report the next material to gather
-    return nextGearNeed(g)
+    // 5) need more iron -> go mine ore (smelting happens on the next call)
+    const got = await gatherMaterial('raw_iron')
+    if (got > 0) return { stage: 'mine-iron', gathered: { raw_iron: got }, message: `mined ${got} iron ore — will smelt next`, gear: gearSummary() }
+    return { done: false, need: 'raw_iron', message: 'no iron ore within reach — explore or dig down to find iron', gear: gearSummary() }
   },
 
   depositChest: async (args) => {
