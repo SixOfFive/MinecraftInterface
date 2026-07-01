@@ -41,6 +41,9 @@ const CONFIG = {
   version: (process.env.MC_VERSION && process.env.MC_VERSION.length) ? process.env.MC_VERSION : false,
   bridgeHost: process.env.BRIDGE_HOST || '127.0.0.1',
   bridgePort: parseInt(process.env.BRIDGE_PORT || '25585', 10),
+  // Headless bots don't need to see far; a small view distance keeps chunk memory
+  // low and prevents the Node heap from ballooning (OOM). tiny|short|normal|far.
+  viewDistance: process.env.MC_VIEW_DISTANCE || 'tiny',
   canDig: envBool('MOVE_CAN_DIG', true),
   autoReconnect: envBool('MC_AUTO_RECONNECT', true),
   reconnectDelayMs: parseInt(process.env.MC_RECONNECT_MS || '5000', 10),
@@ -169,6 +172,7 @@ function createBot () {
   bot = mineflayer.createBot({
     host: CONFIG.mcHost, port: CONFIG.mcPort, username: CONFIG.username,
     auth: CONFIG.auth, version: CONFIG.version,
+    viewDistance: CONFIG.viewDistance, // keep chunk memory small (avoids heap OOM)
   })
   bot.loadPlugin(pathfinder)
   if (pvpPlugin) bot.loadPlugin(pvpPlugin)

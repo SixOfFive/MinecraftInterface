@@ -180,8 +180,9 @@ last‑resort fallback constant, `DEFAULT_MODEL` in `ollama_client.py`.)
 | `--external-bot` | — | off | Don't spawn `bot.js`; connect to one you started |
 | `--list-models` | — | — | Print local Ollama models and exit |
 
-Node‑side extras (env only): `MOVE_CAN_DIG` (`true`/`false` — let the bot tunnel to
-reach goals), `MC_AUTO_RECONNECT`, `MC_RECONNECT_MS`, and the reflex knobs
+Node‑side extras (env only): `MC_VIEW_DISTANCE` (`tiny`/`short`/`normal`/`far` — default
+`tiny` to keep chunk memory low and avoid heap OOM), `MOVE_CAN_DIG` (`true`/`false` — let
+the bot tunnel to reach goals), `MC_AUTO_RECONNECT`, `MC_RECONNECT_MS`, and the reflex knobs
 (`AUTO_EAT`, `AUTO_DEFEND`, `AUTO_PICKUP`, `IDLE_WANDER`, `GREET`, `EAT_AT`,
 `DEFEND_RADIUS`, `FLEE_HEALTH`) — see **Autonomy** above.
 
@@ -225,7 +226,12 @@ its output is always a valid action object — no markdown fences or stray prose
   etc.). Put a tool in the bot's inventory; `mineflayer-collectblock` auto‑equips it.
 - **Bot digs through your builds to reach a goal** — set `MOVE_CAN_DIG=false`.
 - **`player not visible`** — the target player is out of the bot's tracking range;
-  the bot only knows about entities the server has sent it.
+  the bot only knows about entities the server has sent it. If it happens a lot, raise
+  `MC_VIEW_DISTANCE` (at the cost of more memory).
+- **Bot crashes with `JavaScript heap out of memory` (exit 134)** — Mineflayer holds the
+  world's chunks in memory; a large view distance (especially with several wandering bots)
+  can blow the ~4 GB Node heap. Keep `MC_VIEW_DISTANCE=tiny` (the default), and consider
+  `reflex off wander` so idle bots don't keep loading fresh chunks.
 
 ---
 
