@@ -123,11 +123,31 @@ def _assign_to_job(pid: int) -> None:
             return
         try:
             k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-            k32.AssignProcessToJobObject(_JOB_HANDLE, handle)
+            if not k32.AssignProcessToJobObject(_JOB_HANDLE, handle):
+                # Rare on modern Windows; if it ever fails, the graceful terminate is the
+                # fallback — but say so, since a HARD kill could then leak this child.
+                print(f"[controller] warn: could not add pid {pid} to the cleanup job "
+                      f"(err {ctypes.get_last_error()}); graceful shutdown will still stop it.", flush=True)
         finally:
             k32.CloseHandle(handle)
     except Exception:
         pass
+
+
+def _hard_kill_proc(p) -> None:  # noqa: ANN001
+    """Force-kill a child. On POSIX kill its whole process group (spawned with
+    start_new_session) so nothing it forked survives; on Windows kill the PID
+    (the Job Object covers the rest)."""
+    try:
+        if os.name != "nt":
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        else:
+            p.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            p.kill()
+        except Exception:
+            pass
 
 
 def install_signal_handlers(loop: asyncio.AbstractEventLoop, shutdown: asyncio.Event, holders: list) -> None:
@@ -149,10 +169,7 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop, shutdown: asyncio.E
             for h in holders:
                 p = h.get("p")
                 if p and p.returncode is None:
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
+                    _hard_kill_proc(p)
             os._exit(1)  # Job Object closes with the process and reaps any stragglers
 
     for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
@@ -376,33 +393,44 @@ async def supervise_bot(unit: BotUnit, shutdown: asyncio.Event, max_restarts: in
     """
     cfg, bridge, holder, label = unit.cfg, unit.bridge, unit.proc_holder, unit.label
     tag = f"[controller {label}]" if label else "[controller]"
+    base_port = cfg.bridge_port  # immutable band start; scan from here every relaunch
     restarts_left = max_restarts
     while not shutdown.is_set():
-        cfg.bridge_port = _find_free_port(cfg.bridge_host, cfg.bridge_port)
+        # Always scan from this bot's band start (never feed the result back), so a
+        # bot that crash-relaunches repeatedly can't ratchet into a neighbor's band.
+        cfg.bridge_port = _find_free_port(cfg.bridge_host, base_port, limit=18)
         bridge.host, bridge.port = cfg.bridge_host, cfg.bridge_port
         print(f"{tag} launching bot.js (bridge {cfg.bridge_host}:{cfg.bridge_port}) ...", flush=True)
-        proc = await spawn_bot(cfg)
-        holder["p"] = proc
+        proc = None
+        try:
+            proc = await spawn_bot(cfg)
+        finally:
+            holder["p"] = proc  # register before any await so shutdown always sees it
         pipe_task = asyncio.create_task(pipe_output(proc, label))
-
-        # Connect the bridge to this bot.js, aborting the wait if it dies during startup.
-        connect_task = asyncio.create_task(bridge.connect())
-        while not connect_task.done():
-            if proc.returncode is not None or shutdown.is_set():
-                connect_task.cancel()
-                break
-            await asyncio.sleep(0.25)
         try:
-            await connect_task
-        except (BotError, asyncio.CancelledError):
-            pass
-
-        rc = await proc.wait()  # block until bot.js exits
-        pipe_task.cancel()
-        try:
-            await bridge.close()
-        except Exception:
-            pass
+            # Connect the bridge to this bot.js, aborting the wait if it dies during startup.
+            connect_task = asyncio.create_task(bridge.connect())
+            while not connect_task.done():
+                if proc.returncode is not None or shutdown.is_set():
+                    connect_task.cancel()
+                    break
+                await asyncio.sleep(0.25)
+            try:
+                await connect_task
+            except (BotError, asyncio.CancelledError):
+                pass
+            rc = await proc.wait()  # block until bot.js exits
+        finally:
+            # Always tear down the output pump, even if we're being cancelled.
+            pipe_task.cancel()
+            try:
+                await asyncio.gather(pipe_task, return_exceptions=True)
+            except Exception:
+                pass
+            try:
+                await bridge.close()
+            except Exception:
+                pass
 
         if shutdown.is_set():
             break
@@ -461,6 +489,15 @@ async def _broadcast(units: list[BotUnit], action: str, **kw):
     )
 
 
+def _fmt_broadcast(results: list) -> str:
+    """Summarize a _broadcast result so the console doesn't report false success."""
+    total = len(results)
+    if total == 0:
+        return "no bots ready"
+    ok = sum(1 for r in results if not isinstance(r, Exception))
+    return f"{ok}/{total} bots" if ok < total else f"all {total} bots"
+
+
 async def console(units: list[BotUnit], llm: OllamaClient,
                   shutdown: asyncio.Event, cmd_queue: asyncio.Queue) -> None:
     print_help(len(units))
@@ -517,17 +554,21 @@ async def console(units: list[BotUnit], llm: OllamaClient,
                           "wander": "idleWander", "greet": "greet"}
                 if len(parts) >= 2 and parts[0] in ("on", "off"):
                     k = keymap.get(parts[1], parts[1])
-                    await _broadcast(units, "setReflexes", timeout=15, **{k: parts[0] == "on"})
-                    print(f"[you] reflex {k} -> {parts[0]} (all bots)")
+                    res = await _broadcast(units, "setReflexes", timeout=15, **{k: parts[0] == "on"})
+                    print(f"[you] reflex {k} -> {parts[0]} ({_fmt_broadcast(res)})")
                 else:
                     for u in units:
                         if not u.bridge.ready:
+                            print(f"[{u.label or 'bot'}] (offline)")
                             continue
-                        ap = (await u.bridge.send("state", timeout=15)).get("autopilot", {})
-                        print(f"[{u.label or 'bot'}] " + json.dumps(ap))
+                        try:
+                            ap = (await u.bridge.send("state", timeout=15)).get("autopilot", {})
+                            print(f"[{u.label or 'bot'}] " + json.dumps(ap))
+                        except BotError as e:
+                            print(f"[{u.label or 'bot'}] (unavailable: {e})")
             elif v == "owner":
-                await _broadcast(units, "setOwner", username=rest, timeout=15)
-                print(f"[you] owner set for all: {rest!r}")
+                res = await _broadcast(units, "setOwner", username=rest, timeout=15)
+                print(f"[you] owner set: {rest!r} ({_fmt_broadcast(res)})")
             elif v == "heartbeat":
                 try:
                     hb = max(0.0, float(rest)) if rest else 0.0
@@ -547,18 +588,22 @@ async def console(units: list[BotUnit], llm: OllamaClient,
                     a.narrate = val
                 print(f"[you] narration {'on' if val else 'off'} (all bots)")
             elif v == "say":
-                await _broadcast(units, "chat", message=rest, timeout=15)
+                res = await _broadcast(units, "chat", message=rest, timeout=15)
+                print(f"[you] said ({_fmt_broadcast(res)})")
             elif v == "stop":
                 for a in agents:
                     a.set_goal(None)
-                await _broadcast(units, "stop", timeout=15)
-                print("[you] stopped (all bots)")
+                res = await _broadcast(units, "stop", timeout=15)
+                print(f"[you] stopped ({_fmt_broadcast(res)})")
             elif v == "state":
                 for u in units:
                     if not u.bridge.ready:
                         print(f"[{u.label or 'bot'}] (offline)")
                         continue
-                    print(f"[{u.label or 'bot'}] " + json.dumps(await u.bridge.send("state", timeout=15)))
+                    try:
+                        print(f"[{u.label or 'bot'}] " + json.dumps(await u.bridge.send("state", timeout=15)))
+                    except BotError as e:
+                        print(f"[{u.label or 'bot'}] (state error: {e})")
             elif v in ("model", "models"):
                 models = await llm.list_models()
                 if not models:
@@ -623,8 +668,11 @@ async def terminate_all(units: list[BotUnit]) -> None:
     procs = [p for p in procs if p is not None and p.returncode is None]
     for p in procs:
         try:
-            p.terminate()
-        except ProcessLookupError:
+            if os.name != "nt":
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)  # whole group, not just node's PID
+            else:
+                p.terminate()
+        except (ProcessLookupError, PermissionError, OSError):
             pass
     if not procs:
         return
@@ -634,10 +682,7 @@ async def terminate_all(units: list[BotUnit]) -> None:
     except asyncio.TimeoutError:
         for p in procs:
             if p.returncode is None:
-                try:
-                    p.kill()
-                except ProcessLookupError:
-                    pass
+                _hard_kill_proc(p)
 
 
 async def main() -> None:

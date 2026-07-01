@@ -134,15 +134,25 @@ hammering the same dead end.
 
 ## Running more than one bot
 
-Each bot is its own `controller.py`. To add a second, just give it a **unique name**
-(offline mode rejects duplicate usernames) — the bridge port is picked automatically:
+The easiest way is `--bot N` — one controller process runs **N** bots at once, each with
+its own name, bridge port, and supervisor:
 
 ```powershell
-python controller.py --mc-port <port> --username ClaudeBot2 --owner Steve
+python controller.py --mc-port <port> --bot 3 --owner Steve
 ```
 
-All bots share the one Ollama endpoint (requests queue), so more bots = slightly slower
-per-decision when several think at once.
+They get distinct random names (or, with `--username Base`, `Base1`/`Base2`/…). Console
+commands (`job progress`, `say hi`, `stop`, `model`, …) apply to **all** of them at once.
+One bot crashing or getting kicked doesn't take the others down; each relaunches on its own.
+
+**Ctrl-C stops every bot cleanly — no orphaned `node` processes.** A first Ctrl-C shuts them
+all down gracefully; a second forces exit. On Windows the children are held in a Job Object,
+so even if the controller is killed outright (crash, `taskkill`) the OS reaps every bot with
+it.
+
+You can still run separate `controller.py` invocations if you prefer (each is independent);
+give each a unique `--username`. All bots share the one Ollama endpoint (requests queue), so
+more bots = slightly slower per-decision when several think at once.
 
 ## Keeping it going: jobs vs heartbeat
 
@@ -168,7 +178,8 @@ last‑resort fallback constant, `DEFAULT_MODEL` in `ollama_client.py`.)
 |------|-----|---------|---------|
 | `--mc-host` | `MC_HOST` | `127.0.0.1` | Server host |
 | `--mc-port` | `MC_PORT` | `25565` | Server port (the LAN port for Open‑to‑LAN) |
-| `--username` | `MC_USERNAME` | `ClaudeBot` | Bot player name (unique per bot) |
+| `--bot` | `BOT_COUNT` | `1` | How many bots to spawn from this one process (Ctrl‑C stops them all) |
+| `--username` | `MC_USERNAME` | `ClaudeBot` | Bot player name; with `--bot N>1` it's a name prefix |
 | `--owner` | `MC_OWNER` | *(none)* | Player the bot protects / flees toward |
 | `--auth` | `MC_AUTH` | `offline` | `offline` or `microsoft` |
 | `--mc-version` | `MC_VERSION` | *(auto)* | Blank = auto‑detect. If pinning, use a supported **anchor** (see below) |
