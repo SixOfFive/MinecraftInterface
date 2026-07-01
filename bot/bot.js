@@ -342,26 +342,36 @@ async function ensureSticks (need) {
   }
   return invCount('stick') >= need
 }
-async function ensureTable () {
-  let table = nearbyTable()
-  if (table) return table
-  let item = bot.inventory.items().find((i) => i.name === 'crafting_table')
-  if (!item) {
-    if (!await ensurePlanks(4) || !await craftOne('crafting_table', null)) return null
-    item = bot.inventory.items().find((i) => i.name === 'crafting_table')
-    if (!item) return null
-  }
-  try {
-    await bot.equip(item, 'hand')
-    const base = bot.entity.position.floored()
-    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-      const ref = bot.blockAt(base.offset(dx, -1, dz))
-      const cell = bot.blockAt(base.offset(dx, 0, dz))
-      if (ref && ref.boundingBox === 'block' && cell && cell.name === 'air') {
-        try { await bot.lookAt(cell.position.offset(0.5, 0.5, 0.5)); await bot.placeBlock(ref, new Vec3(0, 1, 0)); break } catch (e) {}
+// Place a held block on the ground near the bot. Robust across terrain: a target
+// cell just needs to be PASSABLE (boundingBox 'empty' — air, grass, ferns, snow)
+// with a solid block to place against, and we scan many candidate spots. Shared
+// by ensureTable + ensureFurnace (the old 'must be air' check failed in grass/jungle).
+async function placeBlockNear (itemName) {
+  const item = bot.inventory.items().find((i) => i.name === itemName)
+  if (!item) return false
+  try { await bot.equip(item, 'hand') } catch (e) { return false }
+  const base = bot.entity.position.floored()
+  const cells = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [1, 0, 1], [-1, 0, -1], [1, 0, -1], [-1, 0, 1], [2, 0, 0], [-2, 0, 0], [0, 0, 2], [0, 0, -2]]
+  const faces = [[0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]]
+  for (const [dx, dy, dz] of cells) {
+    const cell = bot.blockAt(base.offset(dx, dy, dz))
+    if (!cell || cell.boundingBox !== 'empty') continue
+    for (const [fx, fy, fz] of faces) {
+      const ref = bot.blockAt(cell.position.offset(fx, fy, fz))
+      if (ref && ref.boundingBox === 'block') {
+        try { await bot.lookAt(cell.position.offset(0.5, 0.5, 0.5)); await bot.placeBlock(ref, new Vec3(-fx, -fy, -fz)); return true } catch (e) {}
       }
     }
-  } catch (e) {}
+  }
+  return false
+}
+async function ensureTable () {
+  const table = nearbyTable()
+  if (table) return table
+  if (!bot.inventory.items().find((i) => i.name === 'crafting_table')) {
+    if (!await ensurePlanks(4) || !await craftOne('crafting_table', null)) return null
+  }
+  await placeBlockNear('crafting_table')
   return nearbyTable()
 }
 function toolTier (kind) {
@@ -424,29 +434,16 @@ function armorTierInSlot (kind) {
   return best
 }
 function haveIronPlus (kind) { return armorTierInSlot(kind) >= ARMOR_TIER.iron }
-// Find or build+place a furnace. Mirrors ensureTable's placement scan.
+// Find or build+place a furnace, using the same robust placement as the table.
 async function ensureFurnace () {
-  let f = nearbyFurnace()
+  const f = nearbyFurnace()
   if (f) return f
-  let item = bot.inventory.items().find((i) => i.name === 'furnace')
-  if (!item) {
+  if (!bot.inventory.items().find((i) => i.name === 'furnace')) {
     if (invCount('cobblestone') < 8) return null
     const table = await ensureTable()
     if (!table || !await craftOne('furnace', table)) return null
-    item = bot.inventory.items().find((i) => i.name === 'furnace')
-    if (!item) return null
   }
-  try {
-    await bot.equip(item, 'hand')
-    const base = bot.entity.position.floored()
-    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) {
-      const ref = bot.blockAt(base.offset(dx, -1, dz))
-      const cell = bot.blockAt(base.offset(dx, 0, dz))
-      if (ref && ref.boundingBox === 'block' && cell && cell.name === 'air') {
-        try { await bot.lookAt(cell.position.offset(0.5, 0.5, 0.5)); await bot.placeBlock(ref, new Vec3(0, 1, 0)); break } catch (e) {}
-      }
-    }
-  } catch (e) {}
+  await placeBlockNear('furnace')
   return nearbyFurnace()
 }
 // Smelt up to `maxItems` raw iron. Fail-soft: recovers input/output on timeout,
