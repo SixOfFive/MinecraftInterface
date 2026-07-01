@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+bot/node_modules/
+bot/package-lock.json
+npm-debug.log*
+
+# Local machine config / secrets (keep your endpoint, owner, etc. off GitHub)
+.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
