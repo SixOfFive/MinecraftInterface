@@ -35,7 +35,7 @@ BOT_DIR = Path(__file__).resolve().parent / "bot"
 JOB_PRESETS = {
     "guard": "Guard this spot. Stay within ~8 blocks of where you are now and attack any hostile mobs that approach. Do not wander far.",
     "patrol": "Patrol the nearby area: keep walking around and attack any hostile mobs you see.",
-    "progress": "Gear up: use gearUp to craft the next tool you need; when it says you need wood or stone, harvestNearest to get it, then gearUp again. Keep upgrading until you have stone tools.",
+    "progress": "Keep upgrading your gear: call gearUp over and over — it GATHERS the wood/stone/iron it needs by itself and climbs the whole ladder (wooden pickaxe -> stone tools -> build a furnace -> smelt iron -> iron pickaxe/sword -> iron armor). Only step in when gearUp reports a need it can't reach: raw_iron (explore or dig down for ore), inventory_space (stashResources), or space (move to open ground). Keep going until you're fully iron-geared.",
     "play": "Play like a real Minecraft player: keep your gear upgraded (gearUp + harvestNearest), then VARY what you do — gather, explore new spots, build, hunt, stash loot in a chest. Don't stand still or repeat one thing.",
     "harvest": "Gather resources continuously: use harvestNearest to mine and collect the nearest useful block. When your inventory is getting full, use stashResources to deposit everything into a chest, then keep gathering.",
     "stash": "Deposit your loot: use stashResources to walk to the nearest chest and store all your gathered resources.",
